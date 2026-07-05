@@ -1,0 +1,7 @@
+dependencies:
+  espnow_mesh:
+    version: "*"
+    override_path: "../../../"
+  cyd_4in_st7796_lvgl:
+    git: https://github.com/brotchie/cyd_4in_st7796_lvgl.git
+    version: main

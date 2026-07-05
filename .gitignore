@@ -1,0 +1,11 @@
+.DS_Store
+build*/
+**/build/
+**/build*/
+**/managed_components/
+**/dependencies.lock
+**/sdkconfig
+**/sdkconfig.*
+!**/sdkconfig.defaults
+**/sdkconfig.old
+dist/

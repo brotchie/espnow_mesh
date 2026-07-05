@@ -1,0 +1,448 @@
+menu "ESP-NOW mesh component"
+
+    config ESPNOW_MESH_DEVICE_ID
+        int "Bench device ID"
+        range 0 255
+        default 0
+        help
+            Local bench label for logs and HIL captures. In the current
+            logic-analyzer setup this matches the analyzer channel:
+            device 0 -> CH0, device 1 -> CH1, device 2 -> CH2.
+
+    choice ESPNOW_MESH_NODE_ROLE
+        prompt "Node role"
+        default ESPNOW_MESH_ROLE_CONTROLLER
+        help
+            Build this firmware as either the one controller or as a satellite.
+
+        config ESPNOW_MESH_ROLE_CONTROLLER
+            bool "Controller"
+
+        config ESPNOW_MESH_ROLE_SATELLITE
+            bool "Satellite"
+    endchoice
+
+    config ESPNOW_MESH_CHANNEL
+        int "ESP-NOW Wi-Fi channel"
+        range 1 14
+        default 1
+        help
+            All controller and satellite boards must use the same 2.4 GHz Wi-Fi
+            channel. ESP-NOW does not scan in this demo.
+
+    config ESPNOW_MESH_ID
+        hex "Application mesh ID"
+        default 0x45534E4D
+        help
+            Application-level mesh identifier included in every ESP-NOW protocol
+            packet. Nodes reject packets whose mesh ID does not match this
+            compile-time value.
+
+    config ESPNOW_MESH_AUTH_ENABLE
+        bool "Authenticate application packets with HMAC-SHA256"
+        default y
+        help
+            Add a truncated HMAC-SHA256 tag to every application-level ESP-NOW
+            packet. This is especially important for broadcast packets because
+            ESP-NOW cannot encrypt broadcast/multicast vendor action frames.
+
+    config ESPNOW_MESH_AUTH_KEY
+        string "Application packet authentication key"
+        default "esp-now-mesh-dev-key-change-me"
+        depends on ESPNOW_MESH_AUTH_ENABLE
+        help
+            Shared secret used to authenticate protocol packets. Every controller
+            and satellite in the mesh must use the same value. Change this from
+            the development default before deployment.
+
+    config ESPNOW_MESH_SEND_RETRIES
+        int "Controller initial broadcast sends per critical sequence"
+        range 1 20
+        default 5
+        help
+            The controller starts each critical sequence with this many
+            broadcasts. After that it retries only satellites that have not
+            ACKed, using unicast and exponential backoff.
+
+    config ESPNOW_MESH_RETRY_INTERVAL_MS
+        int "Initial broadcast interval in milliseconds"
+        range 20 5000
+        default 120
+
+    config ESPNOW_MESH_RELIABLE_MAX_ATTEMPTS
+        int "Reliable delivery max attempts per satellite"
+        range 1 50
+        default 8
+        help
+            Total controller send attempts counted per expected satellite. The
+            initial broadcast fanout attempts count toward this limit.
+
+    config ESPNOW_MESH_RELIABLE_INITIAL_BACKOFF_MS
+        int "Reliable delivery initial unicast backoff in milliseconds"
+        range 20 60000
+        default 150
+
+    config ESPNOW_MESH_RELIABLE_MAX_BACKOFF_MS
+        int "Reliable delivery max unicast backoff in milliseconds"
+        range 20 600000
+        default 2000
+
+    config ESPNOW_MESH_RELIABLE_RETRY_JITTER_MS
+        int "Reliable delivery retry jitter in milliseconds"
+        range 0 1000
+        default 30
+        help
+            Adds deterministic per-satellite jitter to retry scheduling so a
+            group of missing satellites is not retried at one exact cadence.
+
+    config ESPNOW_MESH_RELIABLE_DEADLINE_MS
+        int "Reliable delivery deadline in milliseconds"
+        range 100 600000
+        default 10000
+
+    config ESPNOW_MESH_DATA_INTERVAL_MS
+        int "New sequence interval in milliseconds"
+        range 100 600000
+        default 2000
+
+    config ESPNOW_MESH_TIME_SYNC_INTERVAL_MS
+        int "Satellite time sync interval in milliseconds"
+        range 250 600000
+        default 5000
+        help
+            Satellites periodically exchange NTP-style timestamp packets with
+            the controller and maintain a local offset to controller monotonic
+            time.
+
+    config ESPNOW_MESH_TIME_SYNC_MAX_DELAY_US
+        int "Maximum accepted time sync round-trip delay in microseconds"
+        range 1000 1000000
+        default 30000
+        help
+            Time sync samples above this corrected round-trip delay are ignored
+            because Wi-Fi queueing jitter makes their offset estimate weak.
+
+    config ESPNOW_MESH_TIME_SYNC_FILTER_SHIFT
+        int "Time sync offset filter shift"
+        range 0 8
+        default 3
+        help
+            New accepted offset samples are blended as 1/(2^shift). A value of
+            0 applies each accepted sample immediately. This is used only when
+            the PLL is disabled.
+
+    config ESPNOW_MESH_TIME_SYNC_PLL_ENABLE
+        bool "Enable PLL time sync"
+        default y
+        help
+            Use a proportional/integral software PLL instead of directly
+            applying offset samples. The PLL smooths phase corrections, learns
+            local clock frequency error, and rejects high-delay or high-residual
+            samples.
+
+    config ESPNOW_MESH_TIME_SYNC_PLL_LOCK_SAMPLES
+        int "PLL startup samples before strict rejection"
+        range 1 64
+        default 6
+        depends on ESPNOW_MESH_TIME_SYNC_PLL_ENABLE
+        help
+            The PLL accepts this many valid-delay samples before applying strict
+            residual and low-delay gates. This lets it acquire lock quickly on
+            boot.
+
+    config ESPNOW_MESH_TIME_SYNC_PLL_PHASE_GAIN_SHIFT
+        int "PLL phase correction gain shift"
+        range 0 12
+        default 3
+        depends on ESPNOW_MESH_TIME_SYNC_PLL_ENABLE
+        help
+            Accepted phase residuals adjust the clock phase by
+            residual / 2^shift. A value of 3 applies one eighth of each
+            residual.
+
+    config ESPNOW_MESH_TIME_SYNC_PLL_FREQ_GAIN_SHIFT
+        int "PLL frequency correction gain shift"
+        range 0 16
+        default 8
+        depends on ESPNOW_MESH_TIME_SYNC_PLL_ENABLE
+        help
+            Accepted phase residuals are converted to a frequency error and
+            integrated by 1/2^shift. Larger values make frequency estimates
+            slower but less sensitive to Wi-Fi timestamp jitter.
+
+    config ESPNOW_MESH_TIME_SYNC_PLL_MAX_FREQ_PPB
+        int "PLL maximum frequency correction in ppb"
+        range 0 1000000
+        default 100000
+        depends on ESPNOW_MESH_TIME_SYNC_PLL_ENABLE
+        help
+            Clamp for learned frequency correction. 100000 ppb is 100 ppm,
+            enough for typical ESP32 crystal error while bounding bad samples.
+
+    config ESPNOW_MESH_TIME_SYNC_PLL_OUTLIER_US
+        int "PLL residual outlier threshold in microseconds"
+        range 10 1000000
+        default 3000
+        depends on ESPNOW_MESH_TIME_SYNC_PLL_ENABLE
+        help
+            Once the PLL has acquired its startup samples, a time-sync sample
+            whose phase residual exceeds this threshold is rejected.
+
+    config ESPNOW_MESH_TIME_SYNC_PLL_DELAY_MARGIN_US
+        int "PLL low-delay sample margin in microseconds"
+        range 0 1000000
+        default 5000
+        depends on ESPNOW_MESH_TIME_SYNC_PLL_ENABLE
+        help
+            After startup, samples are accepted only when their corrected
+            round-trip delay is no more than best_seen_delay + this margin.
+
+    config ESPNOW_MESH_TIME_SYNC_PLL_RESET_AFTER_REJECTS
+        int "PLL consecutive rejects before reacquire"
+        range 1 100
+        default 8
+        depends on ESPNOW_MESH_TIME_SYNC_PLL_ENABLE
+        help
+            If this many samples are rejected in a row, the PLL is reacquired
+            from the next valid-delay sample. This handles controller reboots
+            and large discontinuities.
+
+    config ESPNOW_MESH_SYNC_OUTPUT_ENABLE
+        bool "Enable synchronized GPIO output"
+        default y
+        help
+            Drive a GPIO from the shared monotonic mesh time. This is intended
+            for logic-analyzer skew measurements between the controller and
+            satellites.
+
+    config ESPNOW_MESH_SYNC_OUTPUT_GPIO
+        int "Synchronized output GPIO"
+        range 0 48
+        default 5
+        depends on ESPNOW_MESH_SYNC_OUTPUT_ENABLE
+        help
+            GPIO driven by the synchronized output waveform. The current bench
+            uses GPIO5 on ESP32-S3 boards and GPIO6 on the ESP32-C3 board.
+
+    config ESPNOW_MESH_SYNC_OUTPUT_PERIOD_US
+        int "Synchronized output period in microseconds"
+        range 1000 10000000
+        default 100000
+        depends on ESPNOW_MESH_SYNC_OUTPUT_ENABLE
+        help
+            Output waveform period. 100000 us gives a 10 Hz signal.
+
+    config ESPNOW_MESH_SYNC_OUTPUT_HIGH_US
+        int "Synchronized output high time in microseconds"
+        range 1 10000000
+        default 50000
+        depends on ESPNOW_MESH_SYNC_OUTPUT_ENABLE
+        help
+            High portion of each output period. Must be less than the period.
+
+    config ESPNOW_MESH_SYNC_OUTPUT_REQUIRE_SYNC
+        bool "Hold synchronized output low until clock is synced"
+        default y
+        depends on ESPNOW_MESH_SYNC_OUTPUT_ENABLE
+        help
+            Satellites hold the output GPIO low until at least one accepted
+            time-sync sample has established the controller monotonic time
+            estimate. The controller is always considered synced.
+
+    config ESPNOW_MESH_HIL_TEST_ENABLE
+        bool "Enable ESP-NOW HIL protocol test mode"
+        default n
+        select ESPNOW_MESH_SYNC_OUTPUT_ENABLE
+        help
+            Runs a deterministic controller-driven HIL test plan for patch
+            selection, parameter updates, retry recovery, and time-sync
+            degradation. The synchronized output GPIO is used as an application
+            apply marker instead of the normal 10 Hz square wave.
+
+    config ESPNOW_MESH_HIL_EXPECTED_SATELLITES
+        int "HIL expected satellite count"
+        range 1 19
+        default 2
+        depends on ESPNOW_MESH_HIL_TEST_ENABLE
+
+    config ESPNOW_MESH_HIL_CONTROLLER_START_DELAY_MS
+        int "HIL controller start delay in milliseconds"
+        range 0 120000
+        default 8000
+        depends on ESPNOW_MESH_HIL_TEST_ENABLE
+        help
+            Delay before the controller starts the test sequence. This gives
+            host-side logic-analyzer capture time to arm after flashing.
+
+    config ESPNOW_MESH_HIL_DISCOVERY_MS
+        int "HIL discovery and time-sync settle time in milliseconds"
+        range 1000 120000
+        default 7000
+        depends on ESPNOW_MESH_HIL_TEST_ENABLE
+
+    config ESPNOW_MESH_HIL_APPLY_DELAY_US
+        int "HIL command apply delay in microseconds"
+        range 100000 10000000
+        default 1500000
+        depends on ESPNOW_MESH_HIL_TEST_ENABLE
+        help
+            Commands are scheduled this far into the controller monotonic
+            future so retries can complete before the application apply point.
+
+    config ESPNOW_MESH_HIL_CASE_GAP_MS
+        int "HIL gap after each case in milliseconds"
+        range 100 60000
+        default 1600
+        depends on ESPNOW_MESH_HIL_TEST_ENABLE
+
+    config ESPNOW_MESH_HIL_MARK_PULSE_US
+        int "HIL apply marker pulse width in microseconds"
+        range 1000 1000000
+        default 20000
+        depends on ESPNOW_MESH_HIL_TEST_ENABLE
+
+    config ESPNOW_MESH_HIL_RANDOM_START_CHANNEL_ENABLE
+        bool "HIL randomize startup Wi-Fi channel"
+        default n
+        depends on ESPNOW_MESH_HIL_TEST_ENABLE
+        help
+            In HIL mode, pick a runtime startup channel instead of using the
+            compile-time default. The controller runs its registration AP and
+            ESP-NOW on its picked channel. Satellites start on their own picked
+            channel and must discover the controller by scanning for the
+            registration SoftAP.
+
+    config ESPNOW_MESH_HIL_RANDOM_CHANNEL_MIN
+        int "HIL random channel minimum"
+        range 1 14
+        default 1
+        depends on ESPNOW_MESH_HIL_RANDOM_START_CHANNEL_ENABLE
+
+    config ESPNOW_MESH_HIL_RANDOM_CHANNEL_MAX
+        int "HIL random channel maximum"
+        range 1 14
+        default 11
+        depends on ESPNOW_MESH_HIL_RANDOM_START_CHANNEL_ENABLE
+
+    config ESPNOW_MESH_HIL_REQUIRE_SOFTAP_DISCOVERY
+        bool "HIL require registration SoftAP discovery"
+        default y
+        depends on ESPNOW_MESH_HIL_RANDOM_START_CHANNEL_ENABLE && ESPNOW_MESH_REGISTRATION_AP_ENABLE
+        help
+            Satellites ignore ESP-NOW controller traffic until they have
+            successfully associated with the registration SoftAP. This prevents
+            the random-channel HIL test from passing accidentally when a
+            satellite happens to start on the controller's channel.
+
+    config ESPNOW_MESH_HIL_PATCH_BYTES
+        int "HIL patch payload bytes"
+        range 64 2048
+        default 512
+        depends on ESPNOW_MESH_HIL_TEST_ENABLE
+        help
+            Synthetic patch size used by the patch-distribution HIL cases.
+            The default gives eight 64-byte blocks, large enough to exercise
+            fragmentation while keeping the test short.
+
+    config ESPNOW_MESH_HIL_PATCH_BLOCK_BYTES
+        int "HIL patch block payload bytes"
+        range 16 128
+        default 64
+        depends on ESPNOW_MESH_HIL_TEST_ENABLE
+        help
+            Patch block payload bytes per ESP-NOW frame. Keep this small enough
+            that the full patch-block packet remains below ESP-NOW v1's
+            250-byte body limit.
+
+    config ESPNOW_MESH_HIL_PATCH_OFFER_INTERVAL_MS
+        int "HIL patch offer retry interval in milliseconds"
+        range 20 5000
+        default 120
+        depends on ESPNOW_MESH_HIL_TEST_ENABLE
+        help
+            The controller rebroadcasts the patch offer at this cadence until
+            all expected satellites report the staged patch ready. Satellites
+            use each repeated offer as a prompt to re-request the next missing
+            block or resend READY.
+
+    config ESPNOW_MESH_HIL_PATCH_DEADLINE_MS
+        int "HIL patch staging deadline in milliseconds"
+        range 1000 120000
+        default 10000
+        depends on ESPNOW_MESH_HIL_TEST_ENABLE
+
+    config ESPNOW_MESH_PAYLOAD_BYTES
+        int "Payload bytes per data packet"
+        range 16 200
+        default 64
+        help
+            Kept below the ESP-NOW v1 maximum frame size so mixed ESP-NOW
+            versions can still receive these packets.
+
+    config ESPNOW_MESH_MAX_SATELLITES
+        int "Maximum tracked satellites"
+        range 1 19
+        default 8
+        help
+            ESP-NOW supports a limited peer table. This demo reserves one peer
+            slot for broadcast and tracks up to this many satellites.
+
+    config ESPNOW_MESH_REGISTRATION_AP_ENABLE
+        bool "Enable SoftAP self-registration"
+        default y
+        help
+            The controller runs a SoftAP on the ESP-NOW channel. A satellite
+            that does not hear ESP-NOW traffic scans for this AP and briefly
+            connects so the controller can learn its STA MAC address.
+
+    config ESPNOW_MESH_REGISTRATION_SSID
+        string "Registration SoftAP SSID"
+        default "esp-now-mesh"
+
+    config ESPNOW_MESH_REGISTRATION_PASSWORD
+        string "Registration SoftAP password"
+        default "espnowmesh"
+        help
+            Use at least 8 characters for WPA2-PSK. Set an empty string for an
+            open registration AP.
+
+    config ESPNOW_MESH_REGISTRATION_MAX_CONNECTIONS
+        int "Registration SoftAP max simultaneous stations"
+        range 1 10
+        default 5
+
+    config ESPNOW_MESH_REGISTRATION_LISTEN_MS
+        int "Satellite initial ESP-NOW listen time before registration"
+        range 100 600000
+        default 5000
+
+    config ESPNOW_MESH_REGISTRATION_RETRY_INTERVAL_MS
+        int "Satellite registration retry interval"
+        range 1000 600000
+        default 15000
+
+    config ESPNOW_MESH_REGISTRATION_SCAN_MS
+        int "Satellite registration scan time"
+        range 50 1500
+        default 300
+
+    config ESPNOW_MESH_REGISTRATION_CONNECT_TIMEOUT_MS
+        int "Satellite registration AP connect timeout"
+        range 1000 60000
+        default 10000
+
+    config ESPNOW_MESH_REGISTRATION_HOLD_MS
+        int "Satellite registration AP association hold time"
+        range 100 60000
+        default 1500
+        help
+            After connecting to the registration AP, the satellite remains
+            associated for this long so the controller event handler can learn
+            and store its MAC address.
+
+    config ESPNOW_MESH_EVENT_QUEUE_LEN
+        int "Internal event queue length"
+        range 4 128
+        default 32
+
+endmenu

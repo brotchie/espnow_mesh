@@ -1,0 +1,4 @@
+dependencies:
+  espnow_mesh:
+    version: "*"
+    override_path: "../../../"
