@@ -344,10 +344,14 @@ static void init_hil_test(void)
 #endif
 
 #if CONFIG_ESPNOW_MESH_ROLE_CONTROLLER
+#if CONFIG_ESPNOW_MESH_REGISTRATION_AP_ENABLE
 static void controller_note_registered_satellite(const uint8_t *mac);
+#endif
 #else
+#if CONFIG_ESPNOW_MESH_REGISTRATION_AP_ENABLE
 static volatile bool s_registration_sta_connected;
 static uint32_t s_next_registration_ms;
+#endif
 #if CONFIG_ESPNOW_MESH_HIL_TEST_ENABLE
 static bool s_hil_registration_discovered;
 #endif
@@ -834,20 +838,16 @@ static bool hil_fault_drop(uint8_t drop_pct, uint32_t seed, uint32_t sequence,
 
 /*
  * Field validators below run after mesh_rx_packet_type() has already checked the
- * header and HMAC, so they only enforce message-specific semantics.
+ * header and HMAC, so they only enforce message-specific semantics. The offer and
+ * block messages are received by satellites; the request and ready messages by
+ * the controller.
  */
+#if !CONFIG_ESPNOW_MESH_ROLE_CONTROLLER
 static bool patch_offer_fields_valid(const espnow_mesh_patch_offer_msg_t *msg)
 {
     return msg->total_len > 0 && msg->total_len <= CONFIG_ESPNOW_MESH_HIL_PATCH_BYTES &&
            msg->block_size > 0 && msg->block_size <= CONFIG_ESPNOW_MESH_HIL_PATCH_BLOCK_BYTES &&
            msg->block_count > 0 && msg->block_count <= ESPNOW_MESH_HIL_PATCH_MAX_BLOCKS;
-}
-
-static bool patch_block_req_fields_valid(const espnow_mesh_patch_block_req_msg_t *msg)
-{
-    return msg->block_count > 0 &&
-           msg->block_count <= ESPNOW_MESH_HIL_PATCH_MAX_BLOCKS &&
-           msg->block_index < msg->block_count;
 }
 
 static bool patch_block_fields_valid(const espnow_mesh_patch_block_msg_t *msg, uint16_t len)
@@ -866,12 +866,20 @@ static bool patch_block_fields_valid(const espnow_mesh_patch_block_msg_t *msg, u
     }
     return len >= offsetof(espnow_mesh_patch_block_msg_t, payload) + msg->payload_len;
 }
+#else
+static bool patch_block_req_fields_valid(const espnow_mesh_patch_block_req_msg_t *msg)
+{
+    return msg->block_count > 0 &&
+           msg->block_count <= ESPNOW_MESH_HIL_PATCH_MAX_BLOCKS &&
+           msg->block_index < msg->block_count;
+}
 
 static bool patch_ready_fields_valid(const espnow_mesh_patch_ready_msg_t *msg)
 {
     return msg->total_len > 0 && msg->total_len <= CONFIG_ESPNOW_MESH_HIL_PATCH_BYTES &&
            msg->blocks_received <= ESPNOW_MESH_HIL_PATCH_MAX_BLOCKS;
 }
+#endif
 
 static uint8_t hil_patch_byte(uint32_t patch_id, uint32_t offset)
 {
@@ -903,18 +911,19 @@ static uint32_t hil_patch_hash(uint32_t patch_id, uint32_t total_len)
     return hash;
 }
 
+static uint16_t hil_patch_block_count_for_len(uint32_t total_len)
+{
+    return (uint16_t)((total_len + CONFIG_ESPNOW_MESH_HIL_PATCH_BLOCK_BYTES - 1u) /
+                      CONFIG_ESPNOW_MESH_HIL_PATCH_BLOCK_BYTES);
+}
+
+#if CONFIG_ESPNOW_MESH_ROLE_CONTROLLER
 static void hil_fill_patch_block(uint32_t patch_id, uint32_t offset, uint8_t *payload,
                                  uint16_t payload_len)
 {
     for (uint16_t i = 0; i < payload_len; ++i) {
         payload[i] = hil_patch_byte(patch_id, offset + i);
     }
-}
-
-static uint16_t hil_patch_block_count_for_len(uint32_t total_len)
-{
-    return (uint16_t)((total_len + CONFIG_ESPNOW_MESH_HIL_PATCH_BLOCK_BYTES - 1u) /
-                      CONFIG_ESPNOW_MESH_HIL_PATCH_BLOCK_BYTES);
 }
 
 static uint16_t hil_patch_payload_len_for_block(uint16_t block_index, uint32_t total_len)
@@ -928,6 +937,7 @@ static uint16_t hil_patch_payload_len_for_block(uint16_t block_index, uint32_t t
                           ? CONFIG_ESPNOW_MESH_HIL_PATCH_BLOCK_BYTES
                           : remaining);
 }
+#endif
 #endif
 
 #if CONFIG_ESPNOW_MESH_ROLE_CONTROLLER
@@ -963,6 +973,19 @@ static int find_satellite(const uint8_t *mac)
     return -1;
 }
 
+#if CONFIG_ESPNOW_MESH_HIL_TEST_ENABLE
+static int known_satellite_count(void)
+{
+    int known = 0;
+    for (int i = 0; i < CONFIG_ESPNOW_MESH_MAX_SATELLITES; ++i) {
+        if (s_satellites[i].used) {
+            known++;
+        }
+    }
+    return known;
+}
+#endif
+
 static int find_or_add_satellite(const uint8_t *mac)
 {
     int index = find_satellite(mac);
@@ -990,6 +1013,7 @@ static int find_or_add_satellite(const uint8_t *mac)
     return -1;
 }
 
+#if CONFIG_ESPNOW_MESH_REGISTRATION_AP_ENABLE
 static void controller_note_registered_satellite(const uint8_t *mac)
 {
     int index = find_or_add_satellite(mac);
@@ -1000,6 +1024,7 @@ static void controller_note_registered_satellite(const uint8_t *mac)
     s_satellites[index].last_seen_ms = now_ms();
     ESP_LOGI(TAG, "registration AP learned satellite " MACSTR, MAC2STR(mac));
 }
+#endif
 
 static uint32_t retry_jitter_ms(uint32_t sequence, int satellite_index, uint32_t attempt)
 {
@@ -1998,19 +2023,16 @@ static void hil_controller_run(void)
     while ((int32_t)(settle_deadline - now_ms()) > 0) {
         (void)send_controller_packet(BROADCAST_MAC, 1, 1);
         hil_drain_until(now_ms() + 300, 1);
-        if (find_satellite(s_self_mac) >= 0) {
+        if (known_satellite_count() >= CONFIG_ESPNOW_MESH_HIL_EXPECTED_SATELLITES) {
             break;
         }
     }
+    /* Even with all expected satellites discovered, give them one settle window
+     * for time-sync exchanges before the first case fires. */
     hil_drain_until(now_ms() + CONFIG_ESPNOW_MESH_HIL_DISCOVERY_MS, 1);
 
-    int known = 0;
-    for (int i = 0; i < CONFIG_ESPNOW_MESH_MAX_SATELLITES; ++i) {
-        if (s_satellites[i].used) {
-            known++;
-        }
-    }
-    ESP_LOGI(TAG, "HIL discovery complete known_satellites=%d", known);
+    ESP_LOGI(TAG, "HIL discovery complete known_satellites=%d expected=%d",
+             known_satellite_count(), CONFIG_ESPNOW_MESH_HIL_EXPECTED_SATELLITES);
 
     uint32_t sequence = 1;
     for (uint32_t i = 0; i < sizeof(HIL_CASES) / sizeof(HIL_CASES[0]); ++i) {
