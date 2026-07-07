@@ -262,6 +262,7 @@ _Static_assert(sizeof(espnow_mesh_patch_block_msg_t) <= ESP_NOW_MAX_DATA_LEN,
 typedef enum {
     ESPNOW_MESH_EVENT_RECV,
     ESPNOW_MESH_EVENT_SEND,
+    ESPNOW_MESH_EVENT_REGISTRATION,
 } espnow_mesh_event_type_t;
 
 #if CONFIG_ESPNOW_MESH_HIL_TEST_ENABLE
@@ -343,11 +344,7 @@ static void init_hil_test(void)
 }
 #endif
 
-#if CONFIG_ESPNOW_MESH_ROLE_CONTROLLER
-#if CONFIG_ESPNOW_MESH_REGISTRATION_AP_ENABLE
-static void controller_note_registered_satellite(const uint8_t *mac);
-#endif
-#else
+#if !CONFIG_ESPNOW_MESH_ROLE_CONTROLLER
 #if CONFIG_ESPNOW_MESH_REGISTRATION_AP_ENABLE
 static volatile bool s_registration_sta_connected;
 static uint32_t s_next_registration_ms;
@@ -633,6 +630,26 @@ static void queue_send_event(const uint8_t *dest_mac, esp_now_send_status_t stat
     (void)xQueueSend(s_event_queue, &event, 0);
 }
 
+#if CONFIG_ESPNOW_MESH_REGISTRATION_AP_ENABLE && CONFIG_ESPNOW_MESH_ROLE_CONTROLLER
+/*
+ * Called from the default event-loop task. The satellite table is owned by the
+ * mesh task, so registration only enqueues the station MAC and the mesh task
+ * performs the table update when it drains the event.
+ */
+static void queue_registration_event(const uint8_t *sta_mac)
+{
+    if (s_event_queue == NULL || sta_mac == NULL) {
+        return;
+    }
+
+    espnow_mesh_event_t event = {
+        .type = ESPNOW_MESH_EVENT_REGISTRATION,
+    };
+    memcpy(event.mac, sta_mac, ESP_NOW_ETH_ALEN);
+    (void)xQueueSend(s_event_queue, &event, 0);
+}
+#endif
+
 #if ESP_IDF_VERSION >= ESP_IDF_VERSION_VAL(5, 0, 0)
 static void espnow_recv_cb(const esp_now_recv_info_t *info, const uint8_t *data, int data_len)
 {
@@ -713,7 +730,7 @@ static void wifi_event_handler(void *arg, esp_event_base_t event_base, int32_t e
 #if CONFIG_ESPNOW_MESH_REGISTRATION_AP_ENABLE && CONFIG_ESPNOW_MESH_ROLE_CONTROLLER
     if (event_id == WIFI_EVENT_AP_STACONNECTED) {
         const wifi_event_ap_staconnected_t *event = (const wifi_event_ap_staconnected_t *)event_data;
-        controller_note_registered_satellite(event->mac);
+        queue_registration_event(event->mac);
     }
 #endif
 
@@ -942,7 +959,14 @@ static uint16_t hil_patch_payload_len_for_block(uint16_t block_index, uint32_t t
 
 #if CONFIG_ESPNOW_MESH_ROLE_CONTROLLER
 
+/*
+ * The satellite table is owned by the mesh task. The lock only orders slot
+ * claiming against espnow_mesh_get_status(), which snapshots the table from
+ * other tasks; per-field counter updates are read without it and are
+ * eventually consistent.
+ */
 static satellite_node_t s_satellites[CONFIG_ESPNOW_MESH_MAX_SATELLITES];
+static portMUX_TYPE s_satellite_table_lock = portMUX_INITIALIZER_UNLOCKED;
 static uint32_t s_controller_active_sequence;
 static uint32_t s_controller_last_sequence;
 static uint32_t s_controller_last_expected;
@@ -995,8 +1019,10 @@ static int find_or_add_satellite(const uint8_t *mac)
 
     for (int i = 0; i < CONFIG_ESPNOW_MESH_MAX_SATELLITES; ++i) {
         if (!s_satellites[i].used) {
-            s_satellites[i].used = true;
+            portENTER_CRITICAL(&s_satellite_table_lock);
             memcpy(s_satellites[i].mac, mac, ESP_NOW_ETH_ALEN);
+            s_satellites[i].used = true;
+            portEXIT_CRITICAL(&s_satellite_table_lock);
             ESP_LOGI(TAG, "discovered satellite " MACSTR, MAC2STR(mac));
             if (s_espnow_ready) {
                 esp_err_t err = add_peer_if_needed(mac);
@@ -1233,6 +1259,13 @@ static void handle_controller_event(const espnow_mesh_event_t *event, uint32_t a
         }
         return;
     }
+
+#if CONFIG_ESPNOW_MESH_REGISTRATION_AP_ENABLE
+    if (event->type == ESPNOW_MESH_EVENT_REGISTRATION) {
+        controller_note_registered_satellite(event->mac);
+        return;
+    }
+#endif
 
     uint8_t type = 0;
     if (!mesh_rx_packet_type(event, &type)) {
@@ -1762,6 +1795,13 @@ static void hil_handle_controller_event(const espnow_mesh_event_t *event, uint32
         }
         return;
     }
+
+#if CONFIG_ESPNOW_MESH_REGISTRATION_AP_ENABLE
+    if (event->type == ESPNOW_MESH_EVENT_REGISTRATION) {
+        controller_note_registered_satellite(event->mac);
+        return;
+    }
+#endif
 
     uint8_t type = 0;
     if (!mesh_rx_packet_type(event, &type)) {
@@ -3481,6 +3521,7 @@ bool espnow_mesh_get_status(espnow_mesh_status_t *status)
 
     uint32_t current_ms = now_ms();
     size_t out_index = 0;
+    portENTER_CRITICAL(&s_satellite_table_lock);
     for (int i = 0; i < CONFIG_ESPNOW_MESH_MAX_SATELLITES; ++i) {
         const satellite_node_t *node = &s_satellites[i];
         if (!node->used) {
@@ -3504,6 +3545,7 @@ bool espnow_mesh_get_status(espnow_mesh_status_t *status)
         sat->sends_current = node->sends_current;
         sat->last_rssi = node->last_rssi;
     }
+    portEXIT_CRITICAL(&s_satellite_table_lock);
     status->satellite_count = out_index;
 #else
     status->known_satellites = s_have_controller ? 1 : 0;

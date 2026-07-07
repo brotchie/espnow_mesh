@@ -75,6 +75,13 @@ esp_err_t espnow_mesh_run(void);
 
 bool espnow_mesh_get_time_us(int64_t *mesh_time_us);
 bool espnow_mesh_is_time_synced(void);
+
+/*
+ * Snapshot mesh state for dashboards and visualizers. Safe to call from any
+ * task. The snapshot is taken without stopping the mesh task, so it is
+ * eventually consistent: individual counters may lag the mesh task by one
+ * update, but satellite entries are always seen fully initialized.
+ */
 bool espnow_mesh_get_status(espnow_mesh_status_t *status);
 
 #ifdef __cplusplus
