@@ -387,16 +387,27 @@ static bool auth_tags_equal(uint64_t left, uint64_t right)
     return diff == 0;
 }
 
-static bool mesh_auth_tag_compute(const void *packet, size_t len, uint64_t *auth_tag)
-{
-    if (packet == NULL || auth_tag == NULL || len < sizeof(espnow_mesh_header_t)) {
-        return false;
-    }
+/*
+ * One HMAC context is kept keyed and reused for every packet. TX finalize and RX
+ * verification both run on the mesh task, so no locking is needed. Reuse avoids
+ * the per-computation heap allocation inside mbedtls_md_setup().
+ */
+static mbedtls_md_context_t s_auth_ctx;
+static bool s_auth_ctx_ready;
 
-    const size_t tag_offset = offsetof(espnow_mesh_header_t, auth_tag);
-    const size_t tag_end = tag_offset + ESPNOW_MESH_AUTH_TAG_BYTES;
-    if (len < tag_end) {
-        return false;
+static void mesh_auth_ctx_teardown(void)
+{
+    mbedtls_md_free(&s_auth_ctx);
+    s_auth_ctx_ready = false;
+}
+
+static bool mesh_auth_ctx_begin(void)
+{
+    if (s_auth_ctx_ready) {
+        if (mbedtls_md_hmac_reset(&s_auth_ctx) == 0) {
+            return true;
+        }
+        mesh_auth_ctx_teardown();
     }
 
     const char *key = CONFIG_ESPNOW_MESH_AUTH_KEY;
@@ -410,39 +421,47 @@ static bool mesh_auth_tag_compute(const void *packet, size_t len, uint64_t *auth
         return false;
     }
 
+    mbedtls_md_init(&s_auth_ctx);
+    if (mbedtls_md_setup(&s_auth_ctx, md_info, 1) != 0 ||
+        mbedtls_md_hmac_starts(&s_auth_ctx, (const uint8_t *)key, key_len) != 0) {
+        mesh_auth_ctx_teardown();
+        return false;
+    }
+    s_auth_ctx_ready = true;
+    return true;
+}
+
+static bool mesh_auth_tag_compute(const void *packet, size_t len, uint64_t *auth_tag)
+{
+    if (packet == NULL || auth_tag == NULL || len < sizeof(espnow_mesh_header_t)) {
+        return false;
+    }
+
+    const size_t tag_offset = offsetof(espnow_mesh_header_t, auth_tag);
+    const size_t tag_end = tag_offset + ESPNOW_MESH_AUTH_TAG_BYTES;
+    if (len < tag_end) {
+        return false;
+    }
+
+    if (!mesh_auth_ctx_begin()) {
+        return false;
+    }
+
     const uint8_t zero_tag[ESPNOW_MESH_AUTH_TAG_BYTES] = { 0 };
     uint8_t digest[32] = { 0 };
     const uint8_t *bytes = (const uint8_t *)packet;
-    mbedtls_md_context_t ctx;
-    mbedtls_md_init(&ctx);
 
-    bool ok = false;
-    if (mbedtls_md_setup(&ctx, md_info, 1) != 0) {
-        goto out;
-    }
-    if (mbedtls_md_hmac_starts(&ctx, (const uint8_t *)key, key_len) != 0) {
-        goto out;
-    }
-    if (mbedtls_md_hmac_update(&ctx, bytes, tag_offset) != 0) {
-        goto out;
-    }
-    if (mbedtls_md_hmac_update(&ctx, zero_tag, sizeof(zero_tag)) != 0) {
-        goto out;
-    }
-    if (len > tag_end &&
-        mbedtls_md_hmac_update(&ctx, bytes + tag_end, len - tag_end) != 0) {
-        goto out;
-    }
-    if (mbedtls_md_hmac_finish(&ctx, digest) != 0) {
-        goto out;
+    if (mbedtls_md_hmac_update(&s_auth_ctx, bytes, tag_offset) != 0 ||
+        mbedtls_md_hmac_update(&s_auth_ctx, zero_tag, sizeof(zero_tag)) != 0 ||
+        (len > tag_end &&
+         mbedtls_md_hmac_update(&s_auth_ctx, bytes + tag_end, len - tag_end) != 0) ||
+        mbedtls_md_hmac_finish(&s_auth_ctx, digest) != 0) {
+        mesh_auth_ctx_teardown();
+        return false;
     }
 
     *auth_tag = load_u64_le(digest);
-    ok = true;
-
-out:
-    mbedtls_md_free(&ctx);
-    return ok;
+    return true;
 }
 #endif
 
@@ -470,22 +489,28 @@ static esp_err_t mesh_packet_finalize(void *packet, size_t len, uint8_t type)
     return ESP_OK;
 }
 
-static bool mesh_packet_valid(const void *packet, uint16_t len, uint8_t expected_type)
+/*
+ * Validates the header fields and (when auth is enabled) the packet HMAC exactly
+ * once per received frame, on the raw event buffer, which genuinely holds all
+ * event->len bytes. Handlers dispatched on the returned type must still
+ * bound-check event->len before copying into their fixed-size message structs.
+ */
+static bool mesh_rx_packet_type(const espnow_mesh_event_t *event, uint8_t *type_out)
 {
-    if (packet == NULL || len < sizeof(espnow_mesh_header_t)) {
+    if (event == NULL || type_out == NULL || event->len < sizeof(espnow_mesh_header_t)) {
         return false;
     }
 
     espnow_mesh_header_t header = { 0 };
-    memcpy(&header, packet, sizeof(header));
+    memcpy(&header, event->data, sizeof(header));
     if (header.magic != ESPNOW_MESH_MAGIC || header.version != ESPNOW_MESH_VERSION ||
-        header.type != expected_type || header.mesh_id != CONFIG_ESPNOW_MESH_ID) {
+        header.mesh_id != CONFIG_ESPNOW_MESH_ID) {
         return false;
     }
 
 #if CONFIG_ESPNOW_MESH_AUTH_ENABLE
     uint64_t expected_tag = 0;
-    if (!mesh_auth_tag_compute(packet, len, &expected_tag)) {
+    if (!mesh_auth_tag_compute(event->data, event->len, &expected_tag)) {
         return false;
     }
     if (!auth_tags_equal(header.auth_tag, expected_tag)) {
@@ -493,6 +518,7 @@ static bool mesh_packet_valid(const void *packet, uint16_t len, uint8_t expected
     }
 #endif
 
+    *type_out = header.type;
     return true;
 }
 
@@ -770,14 +796,6 @@ static void init_mesh_security(void)
 #endif
 }
 
-static bool header_packet_valid(const espnow_mesh_event_t *event, uint8_t expected_type)
-{
-    if (event == NULL) {
-        return false;
-    }
-    return mesh_packet_valid(event->data, event->len, expected_type);
-}
-
 #if CONFIG_ESPNOW_MESH_HIL_TEST_ENABLE
 typedef enum {
     ESPNOW_MESH_HIL_FAULT_RX_CMD = 1,
@@ -814,41 +832,26 @@ static bool hil_fault_drop(uint8_t drop_pct, uint32_t seed, uint32_t sequence,
     return (hil_mix32(value) % 100u) < drop_pct;
 }
 
-static bool hil_cmd_packet_valid(const espnow_mesh_hil_cmd_msg_t *msg, uint16_t len)
+/*
+ * Field validators below run after mesh_rx_packet_type() has already checked the
+ * header and HMAC, so they only enforce message-specific semantics.
+ */
+static bool patch_offer_fields_valid(const espnow_mesh_patch_offer_msg_t *msg)
 {
-    return len >= sizeof(*msg) && mesh_packet_valid(msg, len, ESPNOW_MESH_MSG_HIL_CMD);
-}
-
-static bool hil_ack_packet_valid(const espnow_mesh_hil_ack_msg_t *msg, uint16_t len)
-{
-    return len >= sizeof(*msg) && mesh_packet_valid(msg, len, ESPNOW_MESH_MSG_HIL_ACK);
-}
-
-static bool patch_offer_packet_valid(const espnow_mesh_patch_offer_msg_t *msg, uint16_t len)
-{
-    return len >= sizeof(*msg) && mesh_packet_valid(msg, len, ESPNOW_MESH_MSG_PATCH_OFFER) &&
-           msg->total_len > 0 && msg->total_len <= CONFIG_ESPNOW_MESH_HIL_PATCH_BYTES &&
+    return msg->total_len > 0 && msg->total_len <= CONFIG_ESPNOW_MESH_HIL_PATCH_BYTES &&
            msg->block_size > 0 && msg->block_size <= CONFIG_ESPNOW_MESH_HIL_PATCH_BLOCK_BYTES &&
            msg->block_count > 0 && msg->block_count <= ESPNOW_MESH_HIL_PATCH_MAX_BLOCKS;
 }
 
-static bool patch_block_req_packet_valid(const espnow_mesh_patch_block_req_msg_t *msg,
-                                         uint16_t len)
+static bool patch_block_req_fields_valid(const espnow_mesh_patch_block_req_msg_t *msg)
 {
-    return len >= sizeof(*msg) && mesh_packet_valid(msg, len, ESPNOW_MESH_MSG_PATCH_BLOCK_REQ) &&
-           msg->block_count > 0 &&
+    return msg->block_count > 0 &&
            msg->block_count <= ESPNOW_MESH_HIL_PATCH_MAX_BLOCKS &&
            msg->block_index < msg->block_count;
 }
 
-static bool patch_block_packet_valid(const espnow_mesh_patch_block_msg_t *msg, uint16_t len)
+static bool patch_block_fields_valid(const espnow_mesh_patch_block_msg_t *msg, uint16_t len)
 {
-    if (len < offsetof(espnow_mesh_patch_block_msg_t, payload)) {
-        return false;
-    }
-    if (!mesh_packet_valid(msg, len, ESPNOW_MESH_MSG_PATCH_BLOCK)) {
-        return false;
-    }
     if (msg->payload_len == 0 || msg->payload_len > sizeof(msg->payload)) {
         return false;
     }
@@ -864,16 +867,10 @@ static bool patch_block_packet_valid(const espnow_mesh_patch_block_msg_t *msg, u
     return len >= offsetof(espnow_mesh_patch_block_msg_t, payload) + msg->payload_len;
 }
 
-static bool patch_ready_packet_valid(const espnow_mesh_patch_ready_msg_t *msg, uint16_t len)
+static bool patch_ready_fields_valid(const espnow_mesh_patch_ready_msg_t *msg)
 {
-    return len >= sizeof(*msg) && mesh_packet_valid(msg, len, ESPNOW_MESH_MSG_PATCH_READY) &&
-           msg->total_len > 0 && msg->total_len <= CONFIG_ESPNOW_MESH_HIL_PATCH_BYTES &&
+    return msg->total_len > 0 && msg->total_len <= CONFIG_ESPNOW_MESH_HIL_PATCH_BYTES &&
            msg->blocks_received <= ESPNOW_MESH_HIL_PATCH_MAX_BLOCKS;
-}
-
-static bool patch_apply_packet_valid(const espnow_mesh_patch_apply_msg_t *msg, uint16_t len)
-{
-    return len >= sizeof(*msg) && mesh_packet_valid(msg, len, ESPNOW_MESH_MSG_PATCH_APPLY);
 }
 
 static uint8_t hil_patch_byte(uint32_t patch_id, uint32_t offset)
@@ -949,16 +946,6 @@ static bool shared_clock_get_time_us(int64_t *mesh_time_us)
     return true;
 }
 #endif
-
-static bool ack_packet_valid(const espnow_mesh_ack_msg_t *msg, uint16_t len)
-{
-    return len >= sizeof(*msg) && mesh_packet_valid(msg, len, ESPNOW_MESH_MSG_ACK);
-}
-
-static bool time_req_packet_valid(const espnow_mesh_time_req_msg_t *msg, uint16_t len)
-{
-    return len >= sizeof(*msg) && mesh_packet_valid(msg, len, ESPNOW_MESH_MSG_TIME_REQ);
-}
 
 #if CONFIG_ESPNOW_MESH_HIL_TEST_ENABLE
 static uint16_t s_hil_time_resp_drop_pct;
@@ -1172,11 +1159,11 @@ static void log_sequence_summary(uint32_t sequence)
 
 static void handle_time_request(const espnow_mesh_event_t *event)
 {
-    espnow_mesh_time_req_msg_t req = { 0 };
-    memcpy(&req, event->data, event->len < sizeof(req) ? event->len : sizeof(req));
-    if (!time_req_packet_valid(&req, event->len)) {
+    if (event->len < sizeof(espnow_mesh_time_req_msg_t)) {
         return;
     }
+    espnow_mesh_time_req_msg_t req = { 0 };
+    memcpy(&req, event->data, sizeof(req));
 
     int index = find_or_add_satellite(event->mac);
     if (index < 0) {
@@ -1222,18 +1209,27 @@ static void handle_controller_event(const espnow_mesh_event_t *event, uint32_t a
         return;
     }
 
-    if (header_packet_valid(event, ESPNOW_MESH_MSG_TIME_REQ)) {
+    uint8_t type = 0;
+    if (!mesh_rx_packet_type(event, &type)) {
+        return;
+    }
+
+    switch (type) {
+    case ESPNOW_MESH_MSG_TIME_REQ:
         handle_time_request(event);
-        return;
+        break;
+    case ESPNOW_MESH_MSG_ACK: {
+        if (event->len < sizeof(espnow_mesh_ack_msg_t)) {
+            break;
+        }
+        espnow_mesh_ack_msg_t ack = { 0 };
+        memcpy(&ack, event->data, sizeof(ack));
+        note_ack(event->mac, &ack, active_sequence);
+        break;
     }
-
-    espnow_mesh_ack_msg_t ack = { 0 };
-    memcpy(&ack, event->data, event->len < sizeof(ack) ? event->len : sizeof(ack));
-    if (!ack_packet_valid(&ack, event->len)) {
-        return;
+    default:
+        break;
     }
-
-    note_ack(event->mac, &ack, active_sequence);
 }
 
 static void drain_controller_events_until(uint32_t deadline_ms, uint32_t active_sequence)
@@ -1636,9 +1632,12 @@ static esp_err_t hil_send_patch_block(const uint8_t *dest_mac,
 
 static void hil_handle_patch_block_request(const espnow_mesh_event_t *event, uint32_t sequence)
 {
+    if (event->len < sizeof(espnow_mesh_patch_block_req_msg_t)) {
+        return;
+    }
     espnow_mesh_patch_block_req_msg_t req = { 0 };
-    memcpy(&req, event->data, event->len < sizeof(req) ? event->len : sizeof(req));
-    if (!patch_block_req_packet_valid(&req, event->len)) {
+    memcpy(&req, event->data, sizeof(req));
+    if (!patch_block_req_fields_valid(&req)) {
         return;
     }
     if (req.sequence != sequence || req.controller_boot_id != s_boot_id) {
@@ -1679,9 +1678,12 @@ static void hil_handle_patch_block_request(const espnow_mesh_event_t *event, uin
 
 static void hil_note_patch_ready(const espnow_mesh_event_t *event, uint32_t sequence)
 {
+    if (event->len < sizeof(espnow_mesh_patch_ready_msg_t)) {
+        return;
+    }
     espnow_mesh_patch_ready_msg_t ready = { 0 };
-    memcpy(&ready, event->data, event->len < sizeof(ready) ? event->len : sizeof(ready));
-    if (!patch_ready_packet_valid(&ready, event->len)) {
+    memcpy(&ready, event->data, sizeof(ready));
+    if (!patch_ready_fields_valid(&ready)) {
         return;
     }
     if (ready.sequence != sequence || ready.controller_boot_id != s_boot_id ||
@@ -1736,39 +1738,42 @@ static void hil_handle_controller_event(const espnow_mesh_event_t *event, uint32
         return;
     }
 
-    if (header_packet_valid(event, ESPNOW_MESH_MSG_TIME_REQ)) {
+    uint8_t type = 0;
+    if (!mesh_rx_packet_type(event, &type)) {
+        return;
+    }
+
+    switch (type) {
+    case ESPNOW_MESH_MSG_TIME_REQ:
         handle_time_request(event);
-        return;
-    }
-
-    if (header_packet_valid(event, ESPNOW_MESH_MSG_PATCH_BLOCK_REQ)) {
+        break;
+    case ESPNOW_MESH_MSG_PATCH_BLOCK_REQ:
         hil_handle_patch_block_request(event, sequence);
-        return;
-    }
-
-    if (header_packet_valid(event, ESPNOW_MESH_MSG_PATCH_READY)) {
+        break;
+    case ESPNOW_MESH_MSG_PATCH_READY:
         hil_note_patch_ready(event, sequence);
-        return;
-    }
-
-    if (header_packet_valid(event, ESPNOW_MESH_MSG_HIL_ACK)) {
+        break;
+    case ESPNOW_MESH_MSG_HIL_ACK: {
+        if (event->len < sizeof(espnow_mesh_hil_ack_msg_t)) {
+            break;
+        }
         espnow_mesh_hil_ack_msg_t ack = { 0 };
-        memcpy(&ack, event->data, event->len < sizeof(ack) ? event->len : sizeof(ack));
-        if (hil_ack_packet_valid(&ack, event->len)) {
-            hil_note_ack(event->mac, &ack, sequence);
-        }
-        return;
+        memcpy(&ack, event->data, sizeof(ack));
+        hil_note_ack(event->mac, &ack, sequence);
+        break;
     }
-
-    if (header_packet_valid(event, ESPNOW_MESH_MSG_ACK)) {
-        espnow_mesh_ack_msg_t ack = { 0 };
-        memcpy(&ack, event->data, event->len < sizeof(ack) ? event->len : sizeof(ack));
-        if (ack_packet_valid(&ack, event->len)) {
-            int index = find_or_add_satellite(event->mac);
-            if (index >= 0) {
-                s_satellites[index].last_seen_ms = now_ms();
-            }
+    case ESPNOW_MESH_MSG_ACK: {
+        if (event->len < sizeof(espnow_mesh_ack_msg_t)) {
+            break;
         }
+        int index = find_or_add_satellite(event->mac);
+        if (index >= 0) {
+            s_satellites[index].last_seen_ms = now_ms();
+        }
+        break;
+    }
+    default:
+        break;
     }
 }
 
@@ -2311,9 +2316,12 @@ static void hil_patch_request_next_missing(const uint8_t *controller_mac)
 
 static void handle_satellite_patch_offer(const espnow_mesh_event_t *event)
 {
+    if (event->len < sizeof(espnow_mesh_patch_offer_msg_t)) {
+        return;
+    }
     espnow_mesh_patch_offer_msg_t offer = { 0 };
-    memcpy(&offer, event->data, event->len < sizeof(offer) ? event->len : sizeof(offer));
-    if (!patch_offer_packet_valid(&offer, event->len)) {
+    memcpy(&offer, event->data, sizeof(offer));
+    if (!patch_offer_fields_valid(&offer)) {
         return;
     }
     if (offer.block_count != hil_patch_block_count_for_len(offer.total_len) ||
@@ -2358,9 +2366,12 @@ static void handle_satellite_patch_offer(const espnow_mesh_event_t *event)
 
 static void handle_satellite_patch_block(const espnow_mesh_event_t *event)
 {
+    if (event->len < offsetof(espnow_mesh_patch_block_msg_t, payload)) {
+        return;
+    }
     espnow_mesh_patch_block_msg_t block = { 0 };
     memcpy(&block, event->data, event->len < sizeof(block) ? event->len : sizeof(block));
-    if (!patch_block_packet_valid(&block, event->len)) {
+    if (!patch_block_fields_valid(&block, event->len)) {
         return;
     }
     if (!s_patch_offer_active || !s_have_controller || !mac_equal(event->mac, s_controller_mac)) {
@@ -2424,11 +2435,11 @@ static void handle_satellite_patch_block(const espnow_mesh_event_t *event)
 
 static void handle_satellite_patch_apply(const espnow_mesh_event_t *event)
 {
-    espnow_mesh_patch_apply_msg_t apply = { 0 };
-    memcpy(&apply, event->data, event->len < sizeof(apply) ? event->len : sizeof(apply));
-    if (!patch_apply_packet_valid(&apply, event->len)) {
+    if (event->len < sizeof(espnow_mesh_patch_apply_msg_t)) {
         return;
     }
+    espnow_mesh_patch_apply_msg_t apply = { 0 };
+    memcpy(&apply, event->data, sizeof(apply));
     if (!hil_accept_controller_from_event(event, apply.controller_boot_id, "patch apply")) {
         return;
     }
@@ -2452,14 +2463,8 @@ static void handle_satellite_patch_apply(const espnow_mesh_event_t *event)
 }
 #endif
 
-static bool data_packet_valid(const espnow_mesh_data_msg_t *msg, uint16_t len)
+static bool data_msg_fields_valid(const espnow_mesh_data_msg_t *msg, uint16_t len)
 {
-    if (len < offsetof(espnow_mesh_data_msg_t, payload)) {
-        return false;
-    }
-    if (!mesh_packet_valid(msg, len, ESPNOW_MESH_MSG_DATA)) {
-        return false;
-    }
     if (msg->payload_len > sizeof(msg->payload)) {
         return false;
     }
@@ -2941,18 +2946,13 @@ static TickType_t satellite_wait_ticks(void)
 }
 #endif
 
-static bool time_resp_packet_valid(const espnow_mesh_time_resp_msg_t *msg, uint16_t len)
-{
-    return len >= sizeof(*msg) && mesh_packet_valid(msg, len, ESPNOW_MESH_MSG_TIME_RESP);
-}
-
 static void handle_time_response(const espnow_mesh_event_t *event)
 {
-    espnow_mesh_time_resp_msg_t resp = { 0 };
-    memcpy(&resp, event->data, event->len < sizeof(resp) ? event->len : sizeof(resp));
-    if (!time_resp_packet_valid(&resp, event->len)) {
+    if (event->len < sizeof(espnow_mesh_time_resp_msg_t)) {
         return;
     }
+    espnow_mesh_time_resp_msg_t resp = { 0 };
+    memcpy(&resp, event->data, sizeof(resp));
 
     if (!s_have_controller || !mac_equal(event->mac, s_controller_mac) ||
         !mac_equal(resp.controller_mac, s_controller_mac)) {
@@ -3032,11 +3032,11 @@ static void handle_time_response(const espnow_mesh_event_t *event)
 #if CONFIG_ESPNOW_MESH_HIL_TEST_ENABLE
 static void handle_satellite_hil_command(const espnow_mesh_event_t *event)
 {
-    espnow_mesh_hil_cmd_msg_t cmd = { 0 };
-    memcpy(&cmd, event->data, event->len < sizeof(cmd) ? event->len : sizeof(cmd));
-    if (!hil_cmd_packet_valid(&cmd, event->len)) {
+    if (event->len < sizeof(espnow_mesh_hil_cmd_msg_t)) {
         return;
     }
+    espnow_mesh_hil_cmd_msg_t cmd = { 0 };
+    memcpy(&cmd, event->data, sizeof(cmd));
     if (!hil_softap_discovery_ready("HIL command")) {
         return;
     }
@@ -3119,9 +3119,12 @@ static void handle_satellite_hil_command(const espnow_mesh_event_t *event)
 
 static void handle_satellite_data(const espnow_mesh_event_t *event)
 {
+    if (event->len < offsetof(espnow_mesh_data_msg_t, payload)) {
+        return;
+    }
     espnow_mesh_data_msg_t msg = { 0 };
     memcpy(&msg, event->data, event->len < sizeof(msg) ? event->len : sizeof(msg));
-    if (!data_packet_valid(&msg, event->len)) {
+    if (!data_msg_fields_valid(&msg, event->len)) {
         return;
     }
 #if CONFIG_ESPNOW_MESH_HIL_TEST_ENABLE
@@ -3215,20 +3218,34 @@ static void satellite_run(void)
             continue;
         }
 
-        if (header_packet_valid(&event, ESPNOW_MESH_MSG_TIME_RESP)) {
+        uint8_t type = 0;
+        if (!mesh_rx_packet_type(&event, &type)) {
+            continue;
+        }
+
+        switch (type) {
+        case ESPNOW_MESH_MSG_TIME_RESP:
             handle_time_response(&event);
+            break;
 #if CONFIG_ESPNOW_MESH_HIL_TEST_ENABLE
-        } else if (header_packet_valid(&event, ESPNOW_MESH_MSG_PATCH_OFFER)) {
+        case ESPNOW_MESH_MSG_PATCH_OFFER:
             handle_satellite_patch_offer(&event);
-        } else if (header_packet_valid(&event, ESPNOW_MESH_MSG_PATCH_BLOCK)) {
+            break;
+        case ESPNOW_MESH_MSG_PATCH_BLOCK:
             handle_satellite_patch_block(&event);
-        } else if (header_packet_valid(&event, ESPNOW_MESH_MSG_PATCH_APPLY)) {
+            break;
+        case ESPNOW_MESH_MSG_PATCH_APPLY:
             handle_satellite_patch_apply(&event);
-        } else if (header_packet_valid(&event, ESPNOW_MESH_MSG_HIL_CMD)) {
+            break;
+        case ESPNOW_MESH_MSG_HIL_CMD:
             handle_satellite_hil_command(&event);
+            break;
 #endif
-        } else {
+        case ESPNOW_MESH_MSG_DATA:
             handle_satellite_data(&event);
+            break;
+        default:
+            break;
         }
     }
 }
