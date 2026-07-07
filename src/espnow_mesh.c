@@ -320,10 +320,17 @@ static uint8_t s_mesh_channel = CONFIG_ESPNOW_MESH_CHANNEL;
 static bool s_espnow_ready;
 static bool s_mesh_initialized;
 
+/*
+ * Reads the shared mesh clock: controller monotonic time on the controller,
+ * the synchronized estimate of it on satellites. Returns false until the
+ * estimate exists (satellites before their first accepted time-sync sample);
+ * the output is still filled with the best available value.
+ */
+static bool shared_clock_get_time_us(int64_t *mesh_time_us);
+
 #if CONFIG_ESPNOW_MESH_SYNC_OUTPUT_ENABLE
 static esp_timer_handle_t s_sync_output_timer;
 
-static bool shared_clock_get_time_us(int64_t *mesh_time_us);
 static void init_sync_output(void);
 #else
 static void init_sync_output(void)
@@ -973,13 +980,11 @@ static uint32_t s_controller_last_expected;
 static uint32_t s_controller_last_acked;
 static bool s_controller_last_sequence_complete;
 
-#if CONFIG_ESPNOW_MESH_SYNC_OUTPUT_ENABLE
 static bool shared_clock_get_time_us(int64_t *mesh_time_us)
 {
     *mesh_time_us = (int64_t)now_us();
     return true;
 }
-#endif
 
 #if CONFIG_ESPNOW_MESH_HIL_TEST_ENABLE
 static uint16_t s_hil_time_resp_drop_pct;
@@ -2717,7 +2722,6 @@ static pll_update_result_t pll_update_from_sample(int64_t sample_local_us,
 }
 #endif
 
-#if CONFIG_ESPNOW_MESH_SYNC_OUTPUT_ENABLE
 static bool shared_clock_get_time_us(int64_t *mesh_time_us)
 {
     int64_t local_time_us = (int64_t)now_us();
@@ -2749,16 +2753,11 @@ static bool shared_clock_get_time_us(int64_t *mesh_time_us)
 #endif
     return have_mesh_time;
 }
-#endif
 
 static int64_t mesh_time_us(void)
 {
     int64_t shared_us = 0;
-#if CONFIG_ESPNOW_MESH_SYNC_OUTPUT_ENABLE
     (void)shared_clock_get_time_us(&shared_us);
-#else
-    shared_us = (int64_t)now_us() + s_mesh_time_offset_us;
-#endif
     return shared_us;
 }
 
@@ -3467,25 +3466,7 @@ bool espnow_mesh_get_time_us(int64_t *mesh_time_out_us)
     if (mesh_time_out_us == NULL) {
         return false;
     }
-
-#if CONFIG_ESPNOW_MESH_ROLE_CONTROLLER
-    *mesh_time_out_us = (int64_t)now_us();
-    return true;
-#else
-#if CONFIG_ESPNOW_MESH_SYNC_OUTPUT_ENABLE
     return shared_clock_get_time_us(mesh_time_out_us);
-#else
-    int64_t offset_us = 0;
-    bool have_mesh_time = false;
-    portENTER_CRITICAL(&s_mesh_time_lock);
-    have_mesh_time = s_have_mesh_time;
-    offset_us = s_mesh_time_offset_us;
-    portEXIT_CRITICAL(&s_mesh_time_lock);
-
-    *mesh_time_out_us = (int64_t)now_us() + offset_us;
-    return have_mesh_time;
-#endif
-#endif
 }
 
 bool espnow_mesh_is_time_synced(void)
