@@ -5,7 +5,6 @@
 #include <stdio.h>
 #include <string.h>
 
-#include "driver/gpio.h"
 #include "esp_err.h"
 #include "esp_event.h"
 #include "esp_log.h"
@@ -22,7 +21,10 @@
 
 #include "espnow_mesh.h"
 
+#include "espnow_mesh_clock.h"
 #include "espnow_mesh_packet.h"
+#include "espnow_mesh_priv.h"
+#include "espnow_mesh_sync_output.h"
 
 typedef struct {
     bool used;
@@ -61,37 +63,6 @@ static uint8_t s_mesh_channel = CONFIG_ESPNOW_MESH_CHANNEL;
 static bool s_espnow_ready;
 static bool s_mesh_initialized;
 
-/*
- * Reads the shared mesh clock: controller monotonic time on the controller,
- * the synchronized estimate of it on satellites. Returns false until the
- * estimate exists (satellites before their first accepted time-sync sample);
- * the output is still filled with the best available value.
- */
-static bool shared_clock_get_time_us(int64_t *mesh_time_us);
-
-#if CONFIG_ESPNOW_MESH_SYNC_OUTPUT_ENABLE
-static esp_timer_handle_t s_sync_output_timer;
-
-static void init_sync_output(void);
-#else
-static void init_sync_output(void)
-{
-}
-#endif
-
-#if CONFIG_ESPNOW_MESH_HIL_TEST_ENABLE
-static esp_timer_handle_t s_hil_marker_off_timer;
-static esp_timer_handle_t s_hil_apply_timer;
-
-static void init_hil_test(void);
-static void hil_mark_apply(void);
-static void hil_schedule_apply_marker(int64_t apply_at_mesh_us);
-#else
-static void init_hil_test(void)
-{
-}
-#endif
-
 #if !CONFIG_ESPNOW_MESH_ROLE_CONTROLLER
 #if CONFIG_ESPNOW_MESH_REGISTRATION_AP_ENABLE
 static volatile bool s_registration_sta_connected;
@@ -101,22 +72,6 @@ static uint32_t s_next_registration_ms;
 static bool s_hil_registration_discovered;
 #endif
 #endif
-
-static uint32_t now_ms(void)
-{
-    return (uint32_t)(esp_timer_get_time() / 1000ULL);
-}
-
-static uint64_t now_us(void)
-{
-    return (uint64_t)esp_timer_get_time();
-}
-
-static bool mac_equal(const uint8_t *left, const uint8_t *right)
-{
-    return memcmp(left, right, ESP_NOW_ETH_ALEN) == 0;
-}
-
 
 #if CONFIG_ESPNOW_MESH_HIL_TEST_ENABLE
 static uint8_t hil_random_channel(void)
@@ -578,7 +533,7 @@ static uint32_t s_controller_last_expected;
 static uint32_t s_controller_last_acked;
 static bool s_controller_last_sequence_complete;
 
-static bool shared_clock_get_time_us(int64_t *mesh_time_us)
+bool shared_clock_get_time_us(int64_t *mesh_time_us)
 {
     *mesh_time_us = (int64_t)now_us();
     return true;
@@ -1842,7 +1797,6 @@ static bool s_patch_offer_active;
 static bool s_patch_ready;
 #endif
 
-static int64_t mesh_time_us(void);
 
 #if CONFIG_ESPNOW_MESH_HIL_TEST_ENABLE
 static void hil_patch_reset_staging(void)
@@ -2367,7 +2321,7 @@ static pll_update_result_t pll_update_from_sample(int64_t sample_local_us,
 }
 #endif
 
-static bool shared_clock_get_time_us(int64_t *mesh_time_us)
+bool shared_clock_get_time_us(int64_t *mesh_time_us)
 {
     int64_t local_time_us = (int64_t)now_us();
     bool have_mesh_time = false;
@@ -2399,7 +2353,7 @@ static bool shared_clock_get_time_us(int64_t *mesh_time_us)
     return have_mesh_time;
 }
 
-static int64_t mesh_time_us(void)
+int64_t mesh_time_us(void)
 {
     int64_t shared_us = 0;
     (void)shared_clock_get_time_us(&shared_us);
@@ -3006,147 +2960,6 @@ static void satellite_run(void)
     }
 }
 
-#endif
-
-#if CONFIG_ESPNOW_MESH_HIL_TEST_ENABLE
-static void hil_marker_off_timer_cb(void *arg)
-{
-    (void)arg;
-    (void)gpio_set_level((gpio_num_t)CONFIG_ESPNOW_MESH_SYNC_OUTPUT_GPIO, 0);
-}
-
-static void hil_apply_timer_cb(void *arg)
-{
-    (void)arg;
-    hil_mark_apply();
-}
-
-static void init_hil_test(void)
-{
-    const esp_timer_create_args_t marker_off_args = {
-        .callback = hil_marker_off_timer_cb,
-        .name = "hil_mark_off",
-    };
-    ESP_ERROR_CHECK(esp_timer_create(&marker_off_args, &s_hil_marker_off_timer));
-
-    const esp_timer_create_args_t apply_args = {
-        .callback = hil_apply_timer_cb,
-        .name = "hil_apply",
-    };
-    ESP_ERROR_CHECK(esp_timer_create(&apply_args, &s_hil_apply_timer));
-}
-
-static void hil_mark_apply(void)
-{
-    (void)esp_timer_stop(s_hil_marker_off_timer);
-    (void)gpio_set_level((gpio_num_t)CONFIG_ESPNOW_MESH_SYNC_OUTPUT_GPIO, 1);
-    esp_err_t err =
-        esp_timer_start_once(s_hil_marker_off_timer, CONFIG_ESPNOW_MESH_HIL_MARK_PULSE_US);
-    if (err != ESP_OK && err != ESP_ERR_INVALID_STATE) {
-        ESP_LOGW(TAG, "HIL marker off schedule failed: %s", esp_err_to_name(err));
-    }
-}
-
-static void hil_schedule_apply_marker(int64_t apply_at_mesh_us)
-{
-    int64_t mesh_now_us = 0;
-    bool ready = shared_clock_get_time_us(&mesh_now_us);
-    int64_t delay_us = ready ? apply_at_mesh_us - mesh_now_us : 100000;
-    if (delay_us < 100) {
-        delay_us = 100;
-    }
-
-    (void)esp_timer_stop(s_hil_apply_timer);
-    esp_err_t err = esp_timer_start_once(s_hil_apply_timer, (uint64_t)delay_us);
-    if (err != ESP_OK) {
-        ESP_LOGW(TAG, "HIL apply marker schedule failed delay=%" PRId64 "us: %s",
-                 delay_us, esp_err_to_name(err));
-    }
-}
-#endif
-
-#if CONFIG_ESPNOW_MESH_SYNC_OUTPUT_ENABLE
-static void sync_output_schedule_us(int64_t delay_us)
-{
-    if (delay_us < 100) {
-        delay_us = 100;
-    }
-
-    esp_err_t err = esp_timer_start_once(s_sync_output_timer, (uint64_t)delay_us);
-    if (err == ESP_ERR_INVALID_STATE) {
-        (void)esp_timer_stop(s_sync_output_timer);
-        err = esp_timer_start_once(s_sync_output_timer, (uint64_t)delay_us);
-    }
-    if (err != ESP_OK) {
-        ESP_LOGW(TAG, "sync output timer schedule failed: %s", esp_err_to_name(err));
-    }
-}
-
-static void sync_output_timer_cb(void *arg)
-{
-    (void)arg;
-
-    int64_t mesh_now_us = 0;
-    bool clock_ready = shared_clock_get_time_us(&mesh_now_us);
-    if (!clock_ready && CONFIG_ESPNOW_MESH_SYNC_OUTPUT_REQUIRE_SYNC) {
-        (void)gpio_set_level((gpio_num_t)CONFIG_ESPNOW_MESH_SYNC_OUTPUT_GPIO, 0);
-        sync_output_schedule_us(10000);
-        return;
-    }
-
-    const int64_t period_us = CONFIG_ESPNOW_MESH_SYNC_OUTPUT_PERIOD_US;
-    const int64_t high_us = CONFIG_ESPNOW_MESH_SYNC_OUTPUT_HIGH_US;
-    int64_t phase_us = mesh_now_us % period_us;
-    if (phase_us < 0) {
-        phase_us += period_us;
-    }
-
-    int level = phase_us < high_us ? 1 : 0;
-    (void)gpio_set_level((gpio_num_t)CONFIG_ESPNOW_MESH_SYNC_OUTPUT_GPIO, level);
-
-    int64_t delay_to_transition_us = level ? (high_us - phase_us) : (period_us - phase_us);
-    sync_output_schedule_us(delay_to_transition_us);
-}
-
-static void init_sync_output(void)
-{
-    if (CONFIG_ESPNOW_MESH_SYNC_OUTPUT_HIGH_US >= CONFIG_ESPNOW_MESH_SYNC_OUTPUT_PERIOD_US) {
-        ESP_LOGE(TAG, "sync output high time must be less than the period");
-        ESP_ERROR_CHECK(ESP_ERR_INVALID_ARG);
-    }
-    if (!GPIO_IS_VALID_OUTPUT_GPIO(CONFIG_ESPNOW_MESH_SYNC_OUTPUT_GPIO)) {
-        ESP_LOGE(TAG, "sync output GPIO %d is not a valid output pin",
-                 CONFIG_ESPNOW_MESH_SYNC_OUTPUT_GPIO);
-        ESP_ERROR_CHECK(ESP_ERR_INVALID_ARG);
-    }
-
-    gpio_config_t io_config = {
-        .pin_bit_mask = 1ULL << CONFIG_ESPNOW_MESH_SYNC_OUTPUT_GPIO,
-        .mode = GPIO_MODE_OUTPUT,
-        .pull_up_en = GPIO_PULLUP_DISABLE,
-        .pull_down_en = GPIO_PULLDOWN_ENABLE,
-        .intr_type = GPIO_INTR_DISABLE,
-    };
-    ESP_ERROR_CHECK(gpio_config(&io_config));
-    ESP_ERROR_CHECK(gpio_set_level((gpio_num_t)CONFIG_ESPNOW_MESH_SYNC_OUTPUT_GPIO, 0));
-
-    const esp_timer_create_args_t timer_args = {
-        .callback = sync_output_timer_cb,
-        .name = "sync_gpio",
-    };
-    ESP_ERROR_CHECK(esp_timer_create(&timer_args, &s_sync_output_timer));
-
-    ESP_LOGI(TAG,
-             "device_id=%d sync output gpio=%d period=%dus high=%dus require_sync=%d",
-             CONFIG_ESPNOW_MESH_DEVICE_ID, CONFIG_ESPNOW_MESH_SYNC_OUTPUT_GPIO,
-             CONFIG_ESPNOW_MESH_SYNC_OUTPUT_PERIOD_US, CONFIG_ESPNOW_MESH_SYNC_OUTPUT_HIGH_US,
-             CONFIG_ESPNOW_MESH_SYNC_OUTPUT_REQUIRE_SYNC ? 1 : 0);
-#if CONFIG_ESPNOW_MESH_HIL_TEST_ENABLE
-    ESP_LOGI(TAG, "HIL test mode owns sync output GPIO for apply markers");
-#else
-    sync_output_schedule_us(100);
-#endif
-}
 #endif
 
 espnow_mesh_role_runtime_t espnow_mesh_role(void)
