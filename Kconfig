@@ -440,6 +440,17 @@ menu "ESP-NOW mesh component"
             associated for this long so the controller event handler can learn
             and store its MAC address.
 
+    config ESPNOW_MESH_CONTROLLER_TIMEOUT_MS
+        int "Satellite controller-loss timeout in milliseconds"
+        range 0 600000
+        default 30000
+        help
+            If a locked satellite hears nothing from its controller for this
+            long, it drops the lock and resumes controller discovery (including
+            registration SoftAP scanning). This recovers satellites when the
+            controller reboots onto a different channel. Set to 0 to keep the
+            controller lock forever once acquired.
+
     config ESPNOW_MESH_EVENT_QUEUE_LEN
         int "Internal event queue length"
         range 4 128

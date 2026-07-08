@@ -2194,6 +2194,9 @@ static uint32_t s_controller_boot_id;
 static bool s_have_last_sequence;
 static uint32_t s_last_sequence;
 static uint32_t s_next_time_sync_ms;
+#if CONFIG_ESPNOW_MESH_CONTROLLER_TIMEOUT_MS > 0
+static uint32_t s_last_controller_rx_ms;
+#endif
 static uint32_t s_time_sync_sequence;
 static uint32_t s_pending_time_sync_sequence;
 static uint64_t s_pending_time_sync_tx_us;
@@ -3292,6 +3295,48 @@ static void handle_satellite_data(const espnow_mesh_event_t *event)
     }
 }
 
+#if CONFIG_ESPNOW_MESH_CONTROLLER_TIMEOUT_MS > 0
+/* Record that a valid frame was received from the locked controller. */
+static void note_controller_activity(void)
+{
+    s_last_controller_rx_ms = now_ms();
+}
+
+/*
+ * Drop the controller lock if nothing has been heard from it for the configured
+ * window. The boot-id and sequence dedup state are kept so a controller that is
+ * still alive on a new channel is re-adopted cleanly, while registration
+ * scanning resumes immediately to rediscover a controller that moved channels.
+ */
+static void check_controller_timeout(void)
+{
+    if (!s_have_controller) {
+        return;
+    }
+    if ((int32_t)(now_ms() - s_last_controller_rx_ms) <
+        CONFIG_ESPNOW_MESH_CONTROLLER_TIMEOUT_MS) {
+        return;
+    }
+
+    ESP_LOGW(TAG, "no controller traffic for %dms; dropping lock on " MACSTR
+                  " and resuming discovery",
+             CONFIG_ESPNOW_MESH_CONTROLLER_TIMEOUT_MS, MAC2STR(s_controller_mac));
+    s_have_controller = false;
+    s_have_pending_time_sync = false;
+#if CONFIG_ESPNOW_MESH_REGISTRATION_AP_ENABLE
+    s_next_registration_ms = now_ms();
+#endif
+}
+#else
+static void note_controller_activity(void)
+{
+}
+
+static void check_controller_timeout(void)
+{
+}
+#endif
+
 static void satellite_run(void)
 {
     ESP_LOGI(TAG, "running as satellite");
@@ -3303,6 +3348,7 @@ static void satellite_run(void)
 
     while (true) {
         log_event_queue_drops_if_any();
+        check_controller_timeout();
         request_time_sync_if_due();
         attempt_registration_if_due();
 
@@ -3346,6 +3392,10 @@ static void satellite_run(void)
             break;
         default:
             break;
+        }
+
+        if (s_have_controller && mac_equal(event.mac, s_controller_mac)) {
+            note_controller_activity();
         }
     }
 }
