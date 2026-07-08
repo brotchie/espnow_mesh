@@ -46,6 +46,7 @@ typedef struct {
     uint8_t channel;
     uint32_t boot_id;
     uint32_t uptime_ms;
+    uint32_t event_drops;
 
     uint32_t active_sequence;
     uint32_t last_sequence;

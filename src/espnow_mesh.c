@@ -8,7 +8,6 @@
 #include "driver/gpio.h"
 #include "esp_err.h"
 #include "esp_event.h"
-#include "esp_idf_version.h"
 #include "esp_log.h"
 #include "esp_mac.h"
 #include "esp_now.h"
@@ -293,6 +292,7 @@ typedef struct {
     uint32_t last_sequence;
     uint32_t ack_count;
     uint32_t sends_current;
+    bool retry_scheduled;
     uint32_t next_retry_ms;
     uint32_t retry_backoff_ms;
     int8_t last_rssi;
@@ -603,6 +603,41 @@ static esp_err_t add_peer_if_needed(const uint8_t *mac)
     return err;
 }
 
+/*
+ * Total events lost to a full queue. Incremented from the Wi-Fi and event-loop
+ * task callbacks, read from the mesh task and the status API; concurrent
+ * increments may occasionally undercount, which is fine for diagnostics.
+ */
+static uint32_t s_event_queue_drops;
+
+static void queue_event_or_count_drop(const espnow_mesh_event_t *event)
+{
+    if (xQueueSend(s_event_queue, event, 0) != pdTRUE) {
+        s_event_queue_drops++;
+    }
+}
+
+/* Called from the mesh task loops so overflow shows up in the log. */
+static void log_event_queue_drops_if_any(void)
+{
+    static uint32_t s_logged_drops;
+    static uint32_t s_last_log_ms;
+
+    uint32_t drops = s_event_queue_drops;
+    if (drops == s_logged_drops) {
+        return;
+    }
+
+    uint32_t current_ms = now_ms();
+    if (s_last_log_ms != 0 && (int32_t)(current_ms - s_last_log_ms) < 1000) {
+        return;
+    }
+
+    ESP_LOGW(TAG, "event queue overflow: %" PRIu32 " events dropped since boot", drops);
+    s_logged_drops = drops;
+    s_last_log_ms = current_ms;
+}
+
 static void queue_recv_event(const uint8_t *src_mac, const uint8_t *data, int data_len, int8_t rssi)
 {
     if (s_event_queue == NULL || src_mac == NULL || data == NULL || data_len <= 0) {
@@ -620,7 +655,7 @@ static void queue_recv_event(const uint8_t *src_mac, const uint8_t *data, int da
     };
     memcpy(event.mac, src_mac, ESP_NOW_ETH_ALEN);
     memcpy(event.data, data, (size_t)data_len);
-    (void)xQueueSend(s_event_queue, &event, 0);
+    queue_event_or_count_drop(&event);
 }
 
 static void queue_send_event(const uint8_t *dest_mac, esp_now_send_status_t status)
@@ -634,7 +669,7 @@ static void queue_send_event(const uint8_t *dest_mac, esp_now_send_status_t stat
         .send_status = status,
     };
     memcpy(event.mac, dest_mac, ESP_NOW_ETH_ALEN);
-    (void)xQueueSend(s_event_queue, &event, 0);
+    queue_event_or_count_drop(&event);
 }
 
 #if CONFIG_ESPNOW_MESH_REGISTRATION_AP_ENABLE && CONFIG_ESPNOW_MESH_ROLE_CONTROLLER
@@ -653,11 +688,10 @@ static void queue_registration_event(const uint8_t *sta_mac)
         .type = ESPNOW_MESH_EVENT_REGISTRATION,
     };
     memcpy(event.mac, sta_mac, ESP_NOW_ETH_ALEN);
-    (void)xQueueSend(s_event_queue, &event, 0);
+    queue_event_or_count_drop(&event);
 }
 #endif
 
-#if ESP_IDF_VERSION >= ESP_IDF_VERSION_VAL(5, 0, 0)
 static void espnow_recv_cb(const esp_now_recv_info_t *info, const uint8_t *data, int data_len)
 {
     int8_t rssi = 0;
@@ -666,24 +700,11 @@ static void espnow_recv_cb(const esp_now_recv_info_t *info, const uint8_t *data,
     }
     queue_recv_event(info == NULL ? NULL : info->src_addr, data, data_len, rssi);
 }
-#else
-static void espnow_recv_cb(const uint8_t *mac_addr, const uint8_t *data, int data_len)
-{
-    queue_recv_event(mac_addr, data, data_len, 0);
-}
-#endif
 
-#if ESP_IDF_VERSION >= ESP_IDF_VERSION_VAL(5, 5, 0)
 static void espnow_send_cb(const esp_now_send_info_t *tx_info, esp_now_send_status_t status)
 {
     queue_send_event(tx_info == NULL ? NULL : tx_info->des_addr, status);
 }
-#else
-static void espnow_send_cb(const uint8_t *mac_addr, esp_now_send_status_t status)
-{
-    queue_send_event(mac_addr, status);
-}
-#endif
 
 static void init_nvs(void)
 {
@@ -703,13 +724,17 @@ static void configure_registration_ap(void)
     size_t ssid_len = strlen(ssid);
     size_t password_len = strlen(password);
 
-    ESP_ERROR_CHECK((ssid_len == 0 || ssid_len > sizeof(((wifi_config_t *)0)->ap.ssid))
-                        ? ESP_ERR_INVALID_ARG
-                        : ESP_OK);
-    ESP_ERROR_CHECK((password_len > sizeof(((wifi_config_t *)0)->ap.password) - 1 ||
-                     (password_len > 0 && password_len < 8))
-                        ? ESP_ERR_INVALID_ARG
-                        : ESP_OK);
+    if (ssid_len == 0 || ssid_len > sizeof(((wifi_config_t *)0)->ap.ssid)) {
+        ESP_LOGE(TAG, "registration SSID must be 1-%zu characters",
+                 sizeof(((wifi_config_t *)0)->ap.ssid));
+        ESP_ERROR_CHECK(ESP_ERR_INVALID_ARG);
+    }
+    if (password_len > sizeof(((wifi_config_t *)0)->ap.password) - 1 ||
+        (password_len > 0 && password_len < 8)) {
+        ESP_LOGE(TAG, "registration password must be empty or 8-%zu characters",
+                 sizeof(((wifi_config_t *)0)->ap.password) - 1);
+        ESP_ERROR_CHECK(ESP_ERR_INVALID_ARG);
+    }
 
     wifi_config_t ap_config = { 0 };
     memcpy(ap_config.ap.ssid, ssid, ssid_len);
@@ -793,7 +818,9 @@ static void init_wifi(void)
 static void init_espnow(void)
 {
     s_event_queue = xQueueCreate(CONFIG_ESPNOW_MESH_EVENT_QUEUE_LEN, sizeof(espnow_mesh_event_t));
-    ESP_ERROR_CHECK(s_event_queue == NULL ? ESP_ERR_NO_MEM : ESP_OK);
+    if (s_event_queue == NULL) {
+        ESP_ERROR_CHECK(ESP_ERR_NO_MEM);
+    }
 
     ESP_ERROR_CHECK(esp_now_init());
     s_espnow_ready = true;
@@ -814,7 +841,10 @@ static void init_boot_id(void)
 static void init_mesh_security(void)
 {
 #if CONFIG_ESPNOW_MESH_AUTH_ENABLE
-    ESP_ERROR_CHECK(strlen(CONFIG_ESPNOW_MESH_AUTH_KEY) == 0 ? ESP_ERR_INVALID_ARG : ESP_OK);
+    if (strlen(CONFIG_ESPNOW_MESH_AUTH_KEY) == 0) {
+        ESP_LOGE(TAG, "CONFIG_ESPNOW_MESH_AUTH_KEY must not be empty while auth is enabled");
+        ESP_ERROR_CHECK(ESP_ERR_INVALID_ARG);
+    }
     ESP_LOGI(TAG, "mesh id=0x%08" PRIx32 " auth=hmac-sha256-64",
              (uint32_t)CONFIG_ESPNOW_MESH_ID);
 #else
@@ -1083,6 +1113,7 @@ static void schedule_next_retry(satellite_node_t *node, int satellite_index, uin
                                 uint32_t current_ms)
 {
     uint32_t jitter_ms = retry_jitter_ms(sequence, satellite_index, node->sends_current);
+    node->retry_scheduled = true;
     node->next_retry_ms = current_ms + node->retry_backoff_ms + jitter_ms;
 
     uint32_t next_backoff_ms = node->retry_backoff_ms * 2;
@@ -1097,6 +1128,7 @@ static void init_satellite_delivery_state(satellite_node_t *node, bool expected)
     node->expected_current = expected;
     node->acked_current = false;
     node->sends_current = 0;
+    node->retry_scheduled = false;
     node->next_retry_ms = 0;
     node->retry_backoff_ms = clamp_backoff_ms(CONFIG_ESPNOW_MESH_RELIABLE_INITIAL_BACKOFF_MS);
 }
@@ -1385,7 +1417,7 @@ static bool send_due_unicast_retries(uint32_t sequence, uint32_t *next_retry_ms)
         }
 
         retryable_missing = true;
-        if (node->next_retry_ms == 0 || retry_time_due(current_ms, node->next_retry_ms)) {
+        if (!node->retry_scheduled || retry_time_due(current_ms, node->next_retry_ms)) {
             uint32_t attempt = node->sends_current + 1;
             esp_err_t err = add_peer_if_needed(node->mac);
             if (err == ESP_OK) {
@@ -1404,7 +1436,7 @@ static bool send_due_unicast_retries(uint32_t sequence, uint32_t *next_retry_ms)
             schedule_next_retry(node, i, sequence, current_ms);
         }
 
-        if (node->next_retry_ms < *next_retry_ms) {
+        if (node->retry_scheduled && node->next_retry_ms < *next_retry_ms) {
             *next_retry_ms = node->next_retry_ms;
         }
     }
@@ -1534,6 +1566,7 @@ static void hil_reset_ack_state(void)
         node->hil_acked_current = false;
         node->hil_patch_ready_current = false;
         node->hil_sends_current = 0;
+        node->retry_scheduled = false;
         node->next_retry_ms = 0;
         node->retry_backoff_ms = clamp_backoff_ms(CONFIG_ESPNOW_MESH_RELIABLE_INITIAL_BACKOFF_MS);
     }
@@ -1924,7 +1957,7 @@ static void hil_send_retries_until_done(const hil_case_t *hil_case, uint32_t seq
                 continue;
             }
 
-            if (node->next_retry_ms == 0 || retry_time_due(current_ms, node->next_retry_ms)) {
+            if (!node->retry_scheduled || retry_time_due(current_ms, node->next_retry_ms)) {
                 uint32_t attempt = node->hil_sends_current + 1;
                 esp_err_t err = add_peer_if_needed(node->mac);
                 if (err == ESP_OK) {
@@ -1936,7 +1969,7 @@ static void hil_send_retries_until_done(const hil_case_t *hil_case, uint32_t seq
                          sequence, attempt, MAC2STR(node->mac), esp_err_to_name(err));
                 schedule_next_retry(node, i, sequence, current_ms);
             }
-            if (node->next_retry_ms != 0 && (int32_t)(node->next_retry_ms - next_retry_ms) < 0) {
+            if (node->retry_scheduled && (int32_t)(node->next_retry_ms - next_retry_ms) < 0) {
                 next_retry_ms = node->next_retry_ms;
             }
         }
@@ -1963,6 +1996,7 @@ static void hil_run_case(const hil_case_t *hil_case, uint32_t sequence)
             CONFIG_ESPNOW_MESH_HIL_CASE_GAP_MS;
     } else {
         s_hil_time_resp_drop_pct = 0;
+        s_hil_time_resp_drop_seed = 0;
         s_hil_time_resp_drop_until_ms = 0;
     }
 
@@ -2092,6 +2126,7 @@ static void hil_controller_run(void)
              (unsigned)((sizeof(HIL_CASES) / sizeof(HIL_CASES[0])) +
                         (sizeof(PATCH_HIL_CASES) / sizeof(PATCH_HIL_CASES[0]))));
     while (true) {
+        log_event_queue_drops_if_any();
         hil_drain_until(now_ms() + 1000, 0);
     }
 }
@@ -2106,6 +2141,7 @@ static void controller_run(void)
     uint32_t sequence = 0;
 
     while (true) {
+        log_event_queue_drops_if_any();
         sequence++;
         if (sequence == 0) {
             sequence = 1;
@@ -3136,7 +3172,8 @@ static void handle_satellite_hil_command(const espnow_mesh_event_t *event)
         return;
     }
 
-    bool duplicate = s_have_last_hil_sequence && cmd.sequence <= s_last_hil_sequence;
+    bool duplicate =
+        s_have_last_hil_sequence && (int32_t)(cmd.sequence - s_last_hil_sequence) <= 0;
     bool accepted = !duplicate;
     if (accepted) {
         s_have_last_hil_sequence = true;
@@ -3218,7 +3255,8 @@ static void handle_satellite_data(const espnow_mesh_event_t *event)
         return;
     }
 
-    bool duplicate = s_have_last_sequence && msg.sequence <= s_last_sequence;
+    bool duplicate =
+        s_have_last_sequence && (int32_t)(msg.sequence - s_last_sequence) <= 0;
     bool accepted = !duplicate;
     if (accepted) {
         s_have_last_sequence = true;
@@ -3264,6 +3302,7 @@ static void satellite_run(void)
 #endif
 
     while (true) {
+        log_event_queue_drops_if_any();
         request_time_sync_if_due();
         attempt_registration_if_due();
 
@@ -3415,13 +3454,15 @@ static void sync_output_timer_cb(void *arg)
 
 static void init_sync_output(void)
 {
-    ESP_ERROR_CHECK(CONFIG_ESPNOW_MESH_SYNC_OUTPUT_HIGH_US >=
-                            CONFIG_ESPNOW_MESH_SYNC_OUTPUT_PERIOD_US
-                        ? ESP_ERR_INVALID_ARG
-                        : ESP_OK);
-    ESP_ERROR_CHECK(GPIO_IS_VALID_OUTPUT_GPIO(CONFIG_ESPNOW_MESH_SYNC_OUTPUT_GPIO)
-                        ? ESP_OK
-                        : ESP_ERR_INVALID_ARG);
+    if (CONFIG_ESPNOW_MESH_SYNC_OUTPUT_HIGH_US >= CONFIG_ESPNOW_MESH_SYNC_OUTPUT_PERIOD_US) {
+        ESP_LOGE(TAG, "sync output high time must be less than the period");
+        ESP_ERROR_CHECK(ESP_ERR_INVALID_ARG);
+    }
+    if (!GPIO_IS_VALID_OUTPUT_GPIO(CONFIG_ESPNOW_MESH_SYNC_OUTPUT_GPIO)) {
+        ESP_LOGE(TAG, "sync output GPIO %d is not a valid output pin",
+                 CONFIG_ESPNOW_MESH_SYNC_OUTPUT_GPIO);
+        ESP_ERROR_CHECK(ESP_ERR_INVALID_ARG);
+    }
 
     gpio_config_t io_config = {
         .pin_bit_mask = 1ULL << CONFIG_ESPNOW_MESH_SYNC_OUTPUT_GPIO,
@@ -3490,6 +3531,7 @@ bool espnow_mesh_get_status(espnow_mesh_status_t *status)
     status->channel = s_mesh_channel;
     status->boot_id = s_boot_id;
     status->uptime_ms = now_ms();
+    status->event_drops = s_event_queue_drops;
 
 #if CONFIG_ESPNOW_MESH_ROLE_CONTROLLER
     status->active_sequence = s_controller_active_sequence;
