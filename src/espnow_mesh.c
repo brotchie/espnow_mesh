@@ -1330,7 +1330,14 @@ static void handle_controller_event(const espnow_mesh_event_t *event, uint32_t a
     }
 }
 
-static void drain_controller_events_until(uint32_t deadline_ms, uint32_t active_sequence)
+/*
+ * Drain and dispatch queued events until the deadline, waking at least every
+ * 100 ms so time-based retry scheduling stays responsive. The event handler
+ * differs between the normal controller loop and the HIL loop, so it is passed
+ * in; sequence is forwarded to the handler as its active-sequence argument.
+ */
+static void drain_events_until(uint32_t deadline_ms, uint32_t sequence,
+                               void (*handler)(const espnow_mesh_event_t *, uint32_t))
 {
     while (true) {
         uint32_t current_ms = now_ms();
@@ -1345,9 +1352,14 @@ static void drain_controller_events_until(uint32_t deadline_ms, uint32_t active_
 
         espnow_mesh_event_t event = { 0 };
         if (xQueueReceive(s_event_queue, &event, pdMS_TO_TICKS(wait_ms)) == pdTRUE) {
-            handle_controller_event(&event, active_sequence);
+            handler(&event, sequence);
         }
     }
+}
+
+static void drain_controller_events_until(uint32_t deadline_ms, uint32_t active_sequence)
+{
+    drain_events_until(deadline_ms, active_sequence, handle_controller_event);
 }
 
 static esp_err_t send_controller_packet(const uint8_t *dest_mac, uint32_t sequence,
@@ -1885,16 +1897,7 @@ static void hil_handle_controller_event(const espnow_mesh_event_t *event, uint32
 
 static void hil_drain_until(uint32_t deadline_ms, uint32_t sequence)
 {
-    while ((int32_t)(deadline_ms - now_ms()) > 0) {
-        uint32_t wait_ms = deadline_ms - now_ms();
-        if (wait_ms > 100) {
-            wait_ms = 100;
-        }
-        espnow_mesh_event_t event = { 0 };
-        if (xQueueReceive(s_event_queue, &event, pdMS_TO_TICKS(wait_ms)) == pdTRUE) {
-            hil_handle_controller_event(&event, sequence);
-        }
-    }
+    drain_events_until(deadline_ms, sequence, hil_handle_controller_event);
 }
 
 static esp_err_t hil_send_cmd(const uint8_t *dest_mac, const hil_case_t *hil_case,
