@@ -1058,6 +1058,9 @@ static int find_or_add_satellite(const uint8_t *mac)
             memcpy(s_satellites[i].mac, mac, ESP_NOW_ETH_ALEN);
             s_satellites[i].used = true;
             portEXIT_CRITICAL(&s_satellite_table_lock);
+            /* Seed the freshness timestamp so the new entry is not immediately
+             * eligible for expiry before its first ACK/time-request lands. */
+            s_satellites[i].last_seen_ms = now_ms();
             ESP_LOGI(TAG, "discovered satellite " MACSTR, MAC2STR(mac));
             if (s_espnow_ready) {
                 esp_err_t err = add_peer_if_needed(mac);
@@ -2132,6 +2135,37 @@ static void hil_controller_run(void)
 }
 #endif
 
+#if !CONFIG_ESPNOW_MESH_HIL_TEST_ENABLE
+/*
+ * Free satellite slots that have gone silent past the configured window. This
+ * stops the controller from retrying (and holding the ACK deadline for) nodes
+ * that have permanently left, and returns their peer and table slots. Runs on
+ * the mesh task at the top of each sequence.
+ */
+static void expire_stale_satellites(void)
+{
+#if CONFIG_ESPNOW_MESH_SATELLITE_EXPIRE_MS > 0
+    uint32_t current_ms = now_ms();
+    for (int i = 0; i < CONFIG_ESPNOW_MESH_MAX_SATELLITES; ++i) {
+        satellite_node_t *node = &s_satellites[i];
+        if (!node->used ||
+            (int32_t)(current_ms - node->last_seen_ms) < CONFIG_ESPNOW_MESH_SATELLITE_EXPIRE_MS) {
+            continue;
+        }
+
+        ESP_LOGW(TAG, "evicting stale satellite " MACSTR " last_seen=%" PRIu32 "ms ago",
+                 MAC2STR(node->mac), current_ms - node->last_seen_ms);
+        if (s_espnow_ready) {
+            (void)esp_now_del_peer(node->mac);
+        }
+        portENTER_CRITICAL(&s_satellite_table_lock);
+        memset(node, 0, sizeof(*node));
+        portEXIT_CRITICAL(&s_satellite_table_lock);
+    }
+#endif
+}
+#endif
+
 static void controller_run(void)
 {
 #if CONFIG_ESPNOW_MESH_HIL_TEST_ENABLE
@@ -2142,6 +2176,7 @@ static void controller_run(void)
 
     while (true) {
         log_event_queue_drops_if_any();
+        expire_stale_satellites();
         sequence++;
         if (sequence == 0) {
             sequence = 1;

@@ -451,6 +451,17 @@ menu "ESP-NOW mesh component"
             controller reboots onto a different channel. Set to 0 to keep the
             controller lock forever once acquired.
 
+    config ESPNOW_MESH_SATELLITE_EXPIRE_MS
+        int "Controller satellite expiry in milliseconds"
+        range 0 3600000
+        default 600000
+        help
+            The controller forgets a satellite it has not heard from for this
+            long: the peer and table slot are freed and it is no longer counted
+            for the ACK quorum or retried. This stops permanently-departed
+            nodes from consuming retries and peer slots forever. Set to 0 to
+            keep satellites in the table indefinitely once discovered.
+
     config ESPNOW_MESH_EVENT_QUEUE_LEN
         int "Internal event queue length"
         range 4 128
