@@ -52,6 +52,37 @@
 #endif
 #endif
 
+/*
+ * Protocol overview
+ * -----------------
+ * All frames share the header (magic, version, type, mesh id, auth tag). The
+ * controller stamps a random per-boot `controller_boot_id` and a monotonically
+ * increasing `sequence`; satellites dedup on (boot_id, sequence) and reset that
+ * state when they see a new boot_id (a controller restart).
+ *
+ * Reliable fanout (DATA / ACK):
+ *   The controller broadcasts DATA for a sequence up to SEND_RETRIES times, then
+ *   unicasts to each satellite that has not ACKed, with exponential backoff and
+ *   jitter, until every expected satellite ACKs or the deadline passes. Each
+ *   satellite ACKs every valid copy it receives (accepted vs duplicate flagged).
+ *
+ * Time sync (TIME_REQ / TIME_RESP):
+ *   A satellite sends TIME_REQ stamped with satellite_tx_us. The controller
+ *   replies with controller_rx_us and controller_tx_us. From the four
+ *   timestamps the satellite computes round-trip delay and a clock offset,
+ *   rejects high-delay samples, and feeds the rest to its PLL/filter to estimate
+ *   controller monotonic time. See espnow_mesh_time_sync.c.
+ *
+ * Patch distribution (HIL only, pull model):
+ *   PATCH_OFFER (metadata + hashes) -> satellite requests each missing block via
+ *   PATCH_BLOCK_REQ -> controller answers with PATCH_BLOCK -> satellite verifies
+ *   the per-block hash, and once all blocks are in, the full-patch hash, then
+ *   sends PATCH_READY. After all expected satellites are ready the controller
+ *   broadcasts PATCH_APPLY with a mesh timestamp to apply in unison.
+ *
+ * HIL command path (HIL only): HIL_CMD / HIL_ACK mirror DATA / ACK but carry
+ * test-case parameters and deterministic fault-injection knobs.
+ */
 typedef enum {
     ESPNOW_MESH_MSG_DATA = 1,
     ESPNOW_MESH_MSG_ACK = 2,

@@ -1,3 +1,24 @@
+/*
+ * espnow_mesh core translation unit: one-time init (NVS, Wi-Fi, ESP-NOW, boot
+ * id, security), public API, the FreeRTOS mesh task, and the role logic - the
+ * controller reliable-fanout loop, the satellite receive/registration loop, and
+ * (when enabled) the HIL test driver. The wire format, packet auth/send,
+ * time-sync estimator, and sync-output actuator live in their own modules.
+ *
+ * Threading model (why most state here needs no locking):
+ *   - A single mesh task owns nearly all mutable state and runs the role loops.
+ *     It is the only writer of the satellite table, sequence counters, and
+ *     satellite time-sync bookkeeping.
+ *   - The ESP-NOW receive/send callbacks and the Wi-Fi event handler run on
+ *     other tasks but only enqueue events (recv, send status, registration)
+ *     onto s_event_queue; the mesh task drains and acts on them.
+ *   - esp_timer callbacks (sync output, HIL markers) run on the esp_timer task
+ *     and touch only their own module state plus the lock-protected clock.
+ *   - The two locks guard the only genuinely cross-task sharing: the satellite
+ *     table (s_satellite_table_lock, for the status snapshot) and the mesh
+ *     clock (owned by espnow_mesh_time_sync.c).
+ */
+
 #include <inttypes.h>
 #include <stdbool.h>
 #include <stddef.h>
