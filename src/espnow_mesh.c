@@ -1,3 +1,24 @@
+/*
+ * espnow_mesh core translation unit: one-time init (NVS, Wi-Fi, ESP-NOW, boot
+ * id, security), public API, the FreeRTOS mesh task, and the role logic - the
+ * controller reliable-fanout loop, the satellite receive/registration loop, and
+ * (when enabled) the HIL test driver. The wire format, packet auth/send,
+ * time-sync estimator, and sync-output actuator live in their own modules.
+ *
+ * Threading model (why most state here needs no locking):
+ *   - A single mesh task owns nearly all mutable state and runs the role loops.
+ *     It is the only writer of the satellite table, sequence counters, and
+ *     satellite time-sync bookkeeping.
+ *   - The ESP-NOW receive/send callbacks and the Wi-Fi event handler run on
+ *     other tasks but only enqueue events (recv, send status, registration)
+ *     onto s_event_queue; the mesh task drains and acts on them.
+ *   - esp_timer callbacks (sync output, HIL markers) run on the esp_timer task
+ *     and touch only their own module state plus the lock-protected clock.
+ *   - The two locks guard the only genuinely cross-task sharing: the satellite
+ *     table (s_satellite_table_lock, for the status snapshot) and the mesh
+ *     clock (owned by espnow_mesh_time_sync.c).
+ */
+
 #include <inttypes.h>
 #include <stdbool.h>
 #include <stddef.h>
@@ -5,10 +26,8 @@
 #include <stdio.h>
 #include <string.h>
 
-#include "driver/gpio.h"
 #include "esp_err.h"
 #include "esp_event.h"
-#include "esp_idf_version.h"
 #include "esp_log.h"
 #include "esp_mac.h"
 #include "esp_now.h"
@@ -19,269 +38,15 @@
 #include "freertos/portmacro.h"
 #include "freertos/queue.h"
 #include "freertos/task.h"
-#include "mbedtls/md.h"
 #include "nvs_flash.h"
 
 #include "espnow_mesh.h"
 
-#define ESPNOW_MESH_MAGIC 0x574f4e45u
-#define ESPNOW_MESH_VERSION 1u
-#define ESPNOW_MESH_AUTH_TAG_BYTES 8u
-
-#define ESPNOW_MESH_HEADER_FIELDS \
-    uint32_t magic;              \
-    uint8_t version;             \
-    uint8_t type;                \
-    uint32_t mesh_id;            \
-    uint64_t auth_tag
-
-#if CONFIG_ESPNOW_MESH_HIL_TEST_ENABLE
-#ifndef CONFIG_ESPNOW_MESH_HIL_RANDOM_START_CHANNEL_ENABLE
-#define CONFIG_ESPNOW_MESH_HIL_RANDOM_START_CHANNEL_ENABLE 0
-#endif
-#ifndef CONFIG_ESPNOW_MESH_HIL_RANDOM_CHANNEL_MIN
-#define CONFIG_ESPNOW_MESH_HIL_RANDOM_CHANNEL_MIN 1
-#endif
-#ifndef CONFIG_ESPNOW_MESH_HIL_RANDOM_CHANNEL_MAX
-#define CONFIG_ESPNOW_MESH_HIL_RANDOM_CHANNEL_MAX 11
-#endif
-#ifndef CONFIG_ESPNOW_MESH_HIL_REQUIRE_SOFTAP_DISCOVERY
-#define CONFIG_ESPNOW_MESH_HIL_REQUIRE_SOFTAP_DISCOVERY 0
-#endif
-#ifndef CONFIG_ESPNOW_MESH_HIL_PATCH_BYTES
-#define CONFIG_ESPNOW_MESH_HIL_PATCH_BYTES 512
-#endif
-#ifndef CONFIG_ESPNOW_MESH_HIL_PATCH_BLOCK_BYTES
-#define CONFIG_ESPNOW_MESH_HIL_PATCH_BLOCK_BYTES 64
-#endif
-#ifndef CONFIG_ESPNOW_MESH_HIL_PATCH_OFFER_INTERVAL_MS
-#define CONFIG_ESPNOW_MESH_HIL_PATCH_OFFER_INTERVAL_MS 120
-#endif
-#ifndef CONFIG_ESPNOW_MESH_HIL_PATCH_DEADLINE_MS
-#define CONFIG_ESPNOW_MESH_HIL_PATCH_DEADLINE_MS 10000
-#endif
-#endif
-
-typedef enum {
-    ESPNOW_MESH_MSG_DATA = 1,
-    ESPNOW_MESH_MSG_ACK = 2,
-    ESPNOW_MESH_MSG_TIME_REQ = 3,
-    ESPNOW_MESH_MSG_TIME_RESP = 4,
-    ESPNOW_MESH_MSG_HIL_CMD = 5,
-    ESPNOW_MESH_MSG_HIL_ACK = 6,
-    ESPNOW_MESH_MSG_PATCH_OFFER = 7,
-    ESPNOW_MESH_MSG_PATCH_BLOCK_REQ = 8,
-    ESPNOW_MESH_MSG_PATCH_BLOCK = 9,
-    ESPNOW_MESH_MSG_PATCH_READY = 10,
-    ESPNOW_MESH_MSG_PATCH_APPLY = 11,
-} espnow_mesh_msg_type_t;
-
-typedef enum {
-    ESPNOW_MESH_HIL_CMD_PATCH_SELECT = 1,
-    ESPNOW_MESH_HIL_CMD_PARAM_SET = 2,
-    ESPNOW_MESH_HIL_CMD_CHANNEL_DISCOVERY = 3,
-} espnow_mesh_hil_cmd_kind_t;
-
-typedef struct __attribute__((packed)) {
-    ESPNOW_MESH_HEADER_FIELDS;
-} espnow_mesh_header_t;
-
-typedef struct __attribute__((packed)) {
-    ESPNOW_MESH_HEADER_FIELDS;
-    uint16_t payload_len;
-    uint32_t sequence;
-    uint8_t controller_mac[ESP_NOW_ETH_ALEN];
-    uint32_t controller_boot_id;
-    uint32_t retry_index;
-    uint32_t sent_ms;
-    uint8_t payload[CONFIG_ESPNOW_MESH_PAYLOAD_BYTES];
-} espnow_mesh_data_msg_t;
-
-typedef struct __attribute__((packed)) {
-    ESPNOW_MESH_HEADER_FIELDS;
-    uint16_t reserved;
-    uint32_t sequence;
-    uint32_t controller_boot_id;
-    uint8_t node_mac[ESP_NOW_ETH_ALEN];
-    uint8_t accepted;
-    uint8_t duplicate;
-    int8_t last_rssi;
-    uint8_t channel;
-    uint32_t uptime_ms;
-} espnow_mesh_ack_msg_t;
-
-typedef struct __attribute__((packed)) {
-    ESPNOW_MESH_HEADER_FIELDS;
-    uint8_t reserved;
-    uint32_t sequence;
-    uint8_t node_mac[ESP_NOW_ETH_ALEN];
-    uint64_t satellite_tx_us;
-} espnow_mesh_time_req_msg_t;
-
-typedef struct __attribute__((packed)) {
-    ESPNOW_MESH_HEADER_FIELDS;
-    uint8_t reserved;
-    uint32_t sequence;
-    uint8_t controller_mac[ESP_NOW_ETH_ALEN];
-    uint64_t satellite_tx_us;
-    uint64_t controller_rx_us;
-    uint64_t controller_tx_us;
-} espnow_mesh_time_resp_msg_t;
-
-typedef struct __attribute__((packed)) {
-    ESPNOW_MESH_HEADER_FIELDS;
-    uint8_t kind;
-    uint32_t sequence;
-    uint32_t controller_boot_id;
-    uint32_t retry_index;
-    uint32_t test_case;
-    uint32_t command_id;
-    uint64_t apply_at_mesh_us;
-    uint32_t patch_id;
-    uint32_t param_id;
-    int32_t param_value;
-    uint8_t rx_drop_pct;
-    uint8_t ack_drop_pct;
-    uint8_t duplicate_send_count;
-    uint8_t reserved;
-    uint16_t time_resp_drop_pct;
-    uint16_t flags;
-    uint32_t fault_seed;
-} espnow_mesh_hil_cmd_msg_t;
-
-typedef struct __attribute__((packed)) {
-    ESPNOW_MESH_HEADER_FIELDS;
-    uint8_t kind;
-    uint32_t sequence;
-    uint32_t controller_boot_id;
-    uint32_t test_case;
-    uint32_t command_id;
-    uint8_t node_mac[ESP_NOW_ETH_ALEN];
-    uint8_t accepted;
-    uint8_t duplicate;
-    int8_t last_rssi;
-    uint8_t channel;
-    uint32_t uptime_ms;
-    uint32_t patch_id;
-    uint32_t param_id;
-    int32_t param_value;
-} espnow_mesh_hil_ack_msg_t;
-
-#if CONFIG_ESPNOW_MESH_HIL_TEST_ENABLE
-#define ESPNOW_MESH_HIL_PATCH_MAX_BLOCKS                                             \
-    ((CONFIG_ESPNOW_MESH_HIL_PATCH_BYTES + CONFIG_ESPNOW_MESH_HIL_PATCH_BLOCK_BYTES - 1) / \
-     CONFIG_ESPNOW_MESH_HIL_PATCH_BLOCK_BYTES)
-
-#if ESPNOW_MESH_HIL_PATCH_MAX_BLOCKS > 32
-#error "CONFIG_ESPNOW_MESH_HIL_PATCH_BYTES / CONFIG_ESPNOW_MESH_HIL_PATCH_BLOCK_BYTES must fit in 32 blocks"
-#endif
-
-typedef struct __attribute__((packed)) {
-    ESPNOW_MESH_HEADER_FIELDS;
-    uint16_t reserved;
-    uint32_t sequence;
-    uint32_t controller_boot_id;
-    uint32_t patch_id;
-    uint32_t total_len;
-    uint16_t block_size;
-    uint16_t block_count;
-    uint32_t patch_hash;
-    uint8_t block_req_drop_pct;
-    uint8_t block_drop_pct;
-    uint8_t ready_drop_pct;
-    uint8_t reserved2;
-    uint32_t fault_seed;
-} espnow_mesh_patch_offer_msg_t;
-
-typedef struct __attribute__((packed)) {
-    ESPNOW_MESH_HEADER_FIELDS;
-    uint16_t reserved;
-    uint32_t sequence;
-    uint32_t controller_boot_id;
-    uint32_t patch_id;
-    uint16_t block_index;
-    uint16_t block_count;
-    uint32_t patch_hash;
-    uint32_t request_sequence;
-    uint8_t block_drop_pct;
-    uint8_t reserved2[3];
-    uint32_t fault_seed;
-} espnow_mesh_patch_block_req_msg_t;
-
-typedef struct __attribute__((packed)) {
-    ESPNOW_MESH_HEADER_FIELDS;
-    uint16_t payload_len;
-    uint32_t sequence;
-    uint32_t controller_boot_id;
-    uint32_t patch_id;
-    uint16_t block_index;
-    uint16_t block_count;
-    uint32_t block_offset;
-    uint32_t total_len;
-    uint32_t patch_hash;
-    uint32_t block_hash;
-    uint32_t request_sequence;
-    uint8_t block_drop_pct;
-    uint8_t reserved[3];
-    uint32_t fault_seed;
-    uint8_t payload[CONFIG_ESPNOW_MESH_HIL_PATCH_BLOCK_BYTES];
-} espnow_mesh_patch_block_msg_t;
-
-typedef struct __attribute__((packed)) {
-    ESPNOW_MESH_HEADER_FIELDS;
-    uint16_t reserved;
-    uint32_t sequence;
-    uint32_t controller_boot_id;
-    uint32_t patch_id;
-    uint32_t patch_hash;
-    uint32_t request_sequence;
-    uint8_t node_mac[ESP_NOW_ETH_ALEN];
-    uint16_t blocks_received;
-    uint32_t total_len;
-    uint32_t uptime_ms;
-} espnow_mesh_patch_ready_msg_t;
-
-typedef struct __attribute__((packed)) {
-    ESPNOW_MESH_HEADER_FIELDS;
-    uint16_t reserved;
-    uint32_t sequence;
-    uint32_t controller_boot_id;
-    uint32_t patch_id;
-    uint32_t patch_hash;
-    uint64_t apply_at_mesh_us;
-} espnow_mesh_patch_apply_msg_t;
-#endif
-
-_Static_assert(sizeof(espnow_mesh_data_msg_t) <= ESP_NOW_MAX_DATA_LEN,
-               "data packets must fit in one ESP-NOW v1 frame");
-#if CONFIG_ESPNOW_MESH_HIL_TEST_ENABLE
-_Static_assert(sizeof(espnow_mesh_patch_block_msg_t) <= ESP_NOW_MAX_DATA_LEN,
-               "patch block packets must fit in one ESP-NOW v1 frame");
-#endif
-
-typedef enum {
-    ESPNOW_MESH_EVENT_RECV,
-    ESPNOW_MESH_EVENT_SEND,
-} espnow_mesh_event_type_t;
-
-#if CONFIG_ESPNOW_MESH_HIL_TEST_ENABLE
-#define ESPNOW_MESH_EVENT_DATA_BYTES                                       \
-    ((sizeof(espnow_mesh_patch_block_msg_t) > sizeof(espnow_mesh_data_msg_t)) \
-         ? sizeof(espnow_mesh_patch_block_msg_t)                            \
-         : sizeof(espnow_mesh_data_msg_t))
-#else
-#define ESPNOW_MESH_EVENT_DATA_BYTES sizeof(espnow_mesh_data_msg_t)
-#endif
-
-typedef struct {
-    espnow_mesh_event_type_t type;
-    uint8_t mac[ESP_NOW_ETH_ALEN];
-    esp_now_send_status_t send_status;
-    int8_t rssi;
-    uint16_t len;
-    uint64_t rx_us;
-    uint8_t data[ESPNOW_MESH_EVENT_DATA_BYTES];
-} espnow_mesh_event_t;
+#include "espnow_mesh_clock.h"
+#include "espnow_mesh_packet.h"
+#include "espnow_mesh_priv.h"
+#include "espnow_mesh_sync_output.h"
+#include "espnow_mesh_time_sync.h"
 
 typedef struct {
     bool used;
@@ -292,6 +57,7 @@ typedef struct {
     uint32_t last_sequence;
     uint32_t ack_count;
     uint32_t sends_current;
+    bool retry_scheduled;
     uint32_t next_retry_ms;
     uint32_t retry_backoff_ms;
     int8_t last_rssi;
@@ -319,202 +85,15 @@ static uint8_t s_mesh_channel = CONFIG_ESPNOW_MESH_CHANNEL;
 static bool s_espnow_ready;
 static bool s_mesh_initialized;
 
-#if CONFIG_ESPNOW_MESH_SYNC_OUTPUT_ENABLE
-static esp_timer_handle_t s_sync_output_timer;
-
-static bool shared_clock_get_time_us(int64_t *mesh_time_us);
-static void init_sync_output(void);
-#else
-static void init_sync_output(void)
-{
-}
-#endif
-
-#if CONFIG_ESPNOW_MESH_HIL_TEST_ENABLE
-static esp_timer_handle_t s_hil_marker_off_timer;
-static esp_timer_handle_t s_hil_apply_timer;
-
-static void init_hil_test(void);
-static void hil_mark_apply(void);
-static void hil_schedule_apply_marker(int64_t apply_at_mesh_us);
-#else
-static void init_hil_test(void)
-{
-}
-#endif
-
-#if CONFIG_ESPNOW_MESH_ROLE_CONTROLLER
-static void controller_note_registered_satellite(const uint8_t *mac);
-#else
+#if !CONFIG_ESPNOW_MESH_ROLE_CONTROLLER
+#if CONFIG_ESPNOW_MESH_REGISTRATION_AP_ENABLE
 static volatile bool s_registration_sta_connected;
 static uint32_t s_next_registration_ms;
+#endif
 #if CONFIG_ESPNOW_MESH_HIL_TEST_ENABLE
 static bool s_hil_registration_discovered;
 #endif
 #endif
-
-static uint32_t now_ms(void)
-{
-    return (uint32_t)(esp_timer_get_time() / 1000ULL);
-}
-
-static uint64_t now_us(void)
-{
-    return (uint64_t)esp_timer_get_time();
-}
-
-static bool mac_equal(const uint8_t *left, const uint8_t *right)
-{
-    return memcmp(left, right, ESP_NOW_ETH_ALEN) == 0;
-}
-
-#if CONFIG_ESPNOW_MESH_AUTH_ENABLE
-static uint64_t load_u64_le(const uint8_t *bytes)
-{
-    uint64_t value = 0;
-    for (size_t i = 0; i < ESPNOW_MESH_AUTH_TAG_BYTES; ++i) {
-        value |= ((uint64_t)bytes[i]) << (8u * i);
-    }
-    return value;
-}
-
-static bool auth_tags_equal(uint64_t left, uint64_t right)
-{
-    uint8_t diff = 0;
-    for (size_t i = 0; i < ESPNOW_MESH_AUTH_TAG_BYTES; ++i) {
-        diff |= (uint8_t)(((left >> (8u * i)) ^ (right >> (8u * i))) & 0xffu);
-    }
-    return diff == 0;
-}
-
-static bool mesh_auth_tag_compute(const void *packet, size_t len, uint64_t *auth_tag)
-{
-    if (packet == NULL || auth_tag == NULL || len < sizeof(espnow_mesh_header_t)) {
-        return false;
-    }
-
-    const size_t tag_offset = offsetof(espnow_mesh_header_t, auth_tag);
-    const size_t tag_end = tag_offset + ESPNOW_MESH_AUTH_TAG_BYTES;
-    if (len < tag_end) {
-        return false;
-    }
-
-    const char *key = CONFIG_ESPNOW_MESH_AUTH_KEY;
-    size_t key_len = strlen(key);
-    if (key_len == 0) {
-        return false;
-    }
-
-    const mbedtls_md_info_t *md_info = mbedtls_md_info_from_type(MBEDTLS_MD_SHA256);
-    if (md_info == NULL) {
-        return false;
-    }
-
-    const uint8_t zero_tag[ESPNOW_MESH_AUTH_TAG_BYTES] = { 0 };
-    uint8_t digest[32] = { 0 };
-    const uint8_t *bytes = (const uint8_t *)packet;
-    mbedtls_md_context_t ctx;
-    mbedtls_md_init(&ctx);
-
-    bool ok = false;
-    if (mbedtls_md_setup(&ctx, md_info, 1) != 0) {
-        goto out;
-    }
-    if (mbedtls_md_hmac_starts(&ctx, (const uint8_t *)key, key_len) != 0) {
-        goto out;
-    }
-    if (mbedtls_md_hmac_update(&ctx, bytes, tag_offset) != 0) {
-        goto out;
-    }
-    if (mbedtls_md_hmac_update(&ctx, zero_tag, sizeof(zero_tag)) != 0) {
-        goto out;
-    }
-    if (len > tag_end &&
-        mbedtls_md_hmac_update(&ctx, bytes + tag_end, len - tag_end) != 0) {
-        goto out;
-    }
-    if (mbedtls_md_hmac_finish(&ctx, digest) != 0) {
-        goto out;
-    }
-
-    *auth_tag = load_u64_le(digest);
-    ok = true;
-
-out:
-    mbedtls_md_free(&ctx);
-    return ok;
-}
-#endif
-
-static esp_err_t mesh_packet_finalize(void *packet, size_t len, uint8_t type)
-{
-    if (packet == NULL || len < sizeof(espnow_mesh_header_t)) {
-        return ESP_ERR_INVALID_SIZE;
-    }
-
-    espnow_mesh_header_t *header = (espnow_mesh_header_t *)packet;
-    header->magic = ESPNOW_MESH_MAGIC;
-    header->version = ESPNOW_MESH_VERSION;
-    header->type = type;
-    header->mesh_id = CONFIG_ESPNOW_MESH_ID;
-    header->auth_tag = 0;
-
-#if CONFIG_ESPNOW_MESH_AUTH_ENABLE
-    uint64_t auth_tag = 0;
-    if (!mesh_auth_tag_compute(packet, len, &auth_tag)) {
-        return ESP_FAIL;
-    }
-    header->auth_tag = auth_tag;
-#endif
-
-    return ESP_OK;
-}
-
-static bool mesh_packet_valid(const void *packet, uint16_t len, uint8_t expected_type)
-{
-    if (packet == NULL || len < sizeof(espnow_mesh_header_t)) {
-        return false;
-    }
-
-    espnow_mesh_header_t header = { 0 };
-    memcpy(&header, packet, sizeof(header));
-    if (header.magic != ESPNOW_MESH_MAGIC || header.version != ESPNOW_MESH_VERSION ||
-        header.type != expected_type || header.mesh_id != CONFIG_ESPNOW_MESH_ID) {
-        return false;
-    }
-
-#if CONFIG_ESPNOW_MESH_AUTH_ENABLE
-    uint64_t expected_tag = 0;
-    if (!mesh_auth_tag_compute(packet, len, &expected_tag)) {
-        return false;
-    }
-    if (!auth_tags_equal(header.auth_tag, expected_tag)) {
-        return false;
-    }
-#endif
-
-    return true;
-}
-
-static esp_err_t mesh_send(const uint8_t *dest_mac, void *packet, size_t len, uint8_t type)
-{
-    esp_err_t err = mesh_packet_finalize(packet, len, type);
-    if (err != ESP_OK) {
-        return err;
-    }
-    return esp_now_send(dest_mac, (const uint8_t *)packet, len);
-}
-
-static uint8_t clamp_wifi_channel(uint8_t channel)
-{
-    if (channel < 1) {
-        return 1;
-    }
-    if (channel > 14) {
-        return 14;
-    }
-    return channel;
-}
 
 #if CONFIG_ESPNOW_MESH_HIL_TEST_ENABLE
 static uint8_t hil_random_channel(void)
@@ -569,6 +148,41 @@ static esp_err_t add_peer_if_needed(const uint8_t *mac)
     return err;
 }
 
+/*
+ * Total events lost to a full queue. Incremented from the Wi-Fi and event-loop
+ * task callbacks, read from the mesh task and the status API; concurrent
+ * increments may occasionally undercount, which is fine for diagnostics.
+ */
+static uint32_t s_event_queue_drops;
+
+static void queue_event_or_count_drop(const espnow_mesh_event_t *event)
+{
+    if (xQueueSend(s_event_queue, event, 0) != pdTRUE) {
+        s_event_queue_drops++;
+    }
+}
+
+/* Called from the mesh task loops so overflow shows up in the log. */
+static void log_event_queue_drops_if_any(void)
+{
+    static uint32_t s_logged_drops;
+    static uint32_t s_last_log_ms;
+
+    uint32_t drops = s_event_queue_drops;
+    if (drops == s_logged_drops) {
+        return;
+    }
+
+    uint32_t current_ms = now_ms();
+    if (s_last_log_ms != 0 && (int32_t)(current_ms - s_last_log_ms) < 1000) {
+        return;
+    }
+
+    ESP_LOGW(TAG, "event queue overflow: %" PRIu32 " events dropped since boot", drops);
+    s_logged_drops = drops;
+    s_last_log_ms = current_ms;
+}
+
 static void queue_recv_event(const uint8_t *src_mac, const uint8_t *data, int data_len, int8_t rssi)
 {
     if (s_event_queue == NULL || src_mac == NULL || data == NULL || data_len <= 0) {
@@ -586,7 +200,7 @@ static void queue_recv_event(const uint8_t *src_mac, const uint8_t *data, int da
     };
     memcpy(event.mac, src_mac, ESP_NOW_ETH_ALEN);
     memcpy(event.data, data, (size_t)data_len);
-    (void)xQueueSend(s_event_queue, &event, 0);
+    queue_event_or_count_drop(&event);
 }
 
 static void queue_send_event(const uint8_t *dest_mac, esp_now_send_status_t status)
@@ -600,10 +214,29 @@ static void queue_send_event(const uint8_t *dest_mac, esp_now_send_status_t stat
         .send_status = status,
     };
     memcpy(event.mac, dest_mac, ESP_NOW_ETH_ALEN);
-    (void)xQueueSend(s_event_queue, &event, 0);
+    queue_event_or_count_drop(&event);
 }
 
-#if ESP_IDF_VERSION >= ESP_IDF_VERSION_VAL(5, 0, 0)
+#if CONFIG_ESPNOW_MESH_REGISTRATION_AP_ENABLE && CONFIG_ESPNOW_MESH_ROLE_CONTROLLER
+/*
+ * Called from the default event-loop task. The satellite table is owned by the
+ * mesh task, so registration only enqueues the station MAC and the mesh task
+ * performs the table update when it drains the event.
+ */
+static void queue_registration_event(const uint8_t *sta_mac)
+{
+    if (s_event_queue == NULL || sta_mac == NULL) {
+        return;
+    }
+
+    espnow_mesh_event_t event = {
+        .type = ESPNOW_MESH_EVENT_REGISTRATION,
+    };
+    memcpy(event.mac, sta_mac, ESP_NOW_ETH_ALEN);
+    queue_event_or_count_drop(&event);
+}
+#endif
+
 static void espnow_recv_cb(const esp_now_recv_info_t *info, const uint8_t *data, int data_len)
 {
     int8_t rssi = 0;
@@ -612,24 +245,11 @@ static void espnow_recv_cb(const esp_now_recv_info_t *info, const uint8_t *data,
     }
     queue_recv_event(info == NULL ? NULL : info->src_addr, data, data_len, rssi);
 }
-#else
-static void espnow_recv_cb(const uint8_t *mac_addr, const uint8_t *data, int data_len)
-{
-    queue_recv_event(mac_addr, data, data_len, 0);
-}
-#endif
 
-#if ESP_IDF_VERSION >= ESP_IDF_VERSION_VAL(5, 5, 0)
 static void espnow_send_cb(const esp_now_send_info_t *tx_info, esp_now_send_status_t status)
 {
     queue_send_event(tx_info == NULL ? NULL : tx_info->des_addr, status);
 }
-#else
-static void espnow_send_cb(const uint8_t *mac_addr, esp_now_send_status_t status)
-{
-    queue_send_event(mac_addr, status);
-}
-#endif
 
 static void init_nvs(void)
 {
@@ -649,13 +269,17 @@ static void configure_registration_ap(void)
     size_t ssid_len = strlen(ssid);
     size_t password_len = strlen(password);
 
-    ESP_ERROR_CHECK((ssid_len == 0 || ssid_len > sizeof(((wifi_config_t *)0)->ap.ssid))
-                        ? ESP_ERR_INVALID_ARG
-                        : ESP_OK);
-    ESP_ERROR_CHECK((password_len > sizeof(((wifi_config_t *)0)->ap.password) - 1 ||
-                     (password_len > 0 && password_len < 8))
-                        ? ESP_ERR_INVALID_ARG
-                        : ESP_OK);
+    if (ssid_len == 0 || ssid_len > sizeof(((wifi_config_t *)0)->ap.ssid)) {
+        ESP_LOGE(TAG, "registration SSID must be 1-%zu characters",
+                 sizeof(((wifi_config_t *)0)->ap.ssid));
+        ESP_ERROR_CHECK(ESP_ERR_INVALID_ARG);
+    }
+    if (password_len > sizeof(((wifi_config_t *)0)->ap.password) - 1 ||
+        (password_len > 0 && password_len < 8)) {
+        ESP_LOGE(TAG, "registration password must be empty or 8-%zu characters",
+                 sizeof(((wifi_config_t *)0)->ap.password) - 1);
+        ESP_ERROR_CHECK(ESP_ERR_INVALID_ARG);
+    }
 
     wifi_config_t ap_config = { 0 };
     memcpy(ap_config.ap.ssid, ssid, ssid_len);
@@ -683,7 +307,7 @@ static void wifi_event_handler(void *arg, esp_event_base_t event_base, int32_t e
 #if CONFIG_ESPNOW_MESH_REGISTRATION_AP_ENABLE && CONFIG_ESPNOW_MESH_ROLE_CONTROLLER
     if (event_id == WIFI_EVENT_AP_STACONNECTED) {
         const wifi_event_ap_staconnected_t *event = (const wifi_event_ap_staconnected_t *)event_data;
-        controller_note_registered_satellite(event->mac);
+        queue_registration_event(event->mac);
     }
 #endif
 
@@ -739,7 +363,9 @@ static void init_wifi(void)
 static void init_espnow(void)
 {
     s_event_queue = xQueueCreate(CONFIG_ESPNOW_MESH_EVENT_QUEUE_LEN, sizeof(espnow_mesh_event_t));
-    ESP_ERROR_CHECK(s_event_queue == NULL ? ESP_ERR_NO_MEM : ESP_OK);
+    if (s_event_queue == NULL) {
+        ESP_ERROR_CHECK(ESP_ERR_NO_MEM);
+    }
 
     ESP_ERROR_CHECK(esp_now_init());
     s_espnow_ready = true;
@@ -760,7 +386,10 @@ static void init_boot_id(void)
 static void init_mesh_security(void)
 {
 #if CONFIG_ESPNOW_MESH_AUTH_ENABLE
-    ESP_ERROR_CHECK(strlen(CONFIG_ESPNOW_MESH_AUTH_KEY) == 0 ? ESP_ERR_INVALID_ARG : ESP_OK);
+    if (strlen(CONFIG_ESPNOW_MESH_AUTH_KEY) == 0) {
+        ESP_LOGE(TAG, "CONFIG_ESPNOW_MESH_AUTH_KEY must not be empty while auth is enabled");
+        ESP_ERROR_CHECK(ESP_ERR_INVALID_ARG);
+    }
     ESP_LOGI(TAG, "mesh id=0x%08" PRIx32 " auth=hmac-sha256-64",
              (uint32_t)CONFIG_ESPNOW_MESH_ID);
 #else
@@ -768,14 +397,6 @@ static void init_mesh_security(void)
                   " auth disabled; ESP-NOW packets are filtered by mesh id only",
              (uint32_t)CONFIG_ESPNOW_MESH_ID);
 #endif
-}
-
-static bool header_packet_valid(const espnow_mesh_event_t *event, uint8_t expected_type)
-{
-    if (event == NULL) {
-        return false;
-    }
-    return mesh_packet_valid(event->data, event->len, expected_type);
 }
 
 #if CONFIG_ESPNOW_MESH_HIL_TEST_ENABLE
@@ -814,41 +435,22 @@ static bool hil_fault_drop(uint8_t drop_pct, uint32_t seed, uint32_t sequence,
     return (hil_mix32(value) % 100u) < drop_pct;
 }
 
-static bool hil_cmd_packet_valid(const espnow_mesh_hil_cmd_msg_t *msg, uint16_t len)
+/*
+ * Field validators below run after mesh_rx_packet_type() has already checked the
+ * header and HMAC, so they only enforce message-specific semantics. The offer and
+ * block messages are received by satellites; the request and ready messages by
+ * the controller.
+ */
+#if !CONFIG_ESPNOW_MESH_ROLE_CONTROLLER
+static bool patch_offer_fields_valid(const espnow_mesh_patch_offer_msg_t *msg)
 {
-    return len >= sizeof(*msg) && mesh_packet_valid(msg, len, ESPNOW_MESH_MSG_HIL_CMD);
-}
-
-static bool hil_ack_packet_valid(const espnow_mesh_hil_ack_msg_t *msg, uint16_t len)
-{
-    return len >= sizeof(*msg) && mesh_packet_valid(msg, len, ESPNOW_MESH_MSG_HIL_ACK);
-}
-
-static bool patch_offer_packet_valid(const espnow_mesh_patch_offer_msg_t *msg, uint16_t len)
-{
-    return len >= sizeof(*msg) && mesh_packet_valid(msg, len, ESPNOW_MESH_MSG_PATCH_OFFER) &&
-           msg->total_len > 0 && msg->total_len <= CONFIG_ESPNOW_MESH_HIL_PATCH_BYTES &&
+    return msg->total_len > 0 && msg->total_len <= CONFIG_ESPNOW_MESH_HIL_PATCH_BYTES &&
            msg->block_size > 0 && msg->block_size <= CONFIG_ESPNOW_MESH_HIL_PATCH_BLOCK_BYTES &&
            msg->block_count > 0 && msg->block_count <= ESPNOW_MESH_HIL_PATCH_MAX_BLOCKS;
 }
 
-static bool patch_block_req_packet_valid(const espnow_mesh_patch_block_req_msg_t *msg,
-                                         uint16_t len)
+static bool patch_block_fields_valid(const espnow_mesh_patch_block_msg_t *msg, uint16_t len)
 {
-    return len >= sizeof(*msg) && mesh_packet_valid(msg, len, ESPNOW_MESH_MSG_PATCH_BLOCK_REQ) &&
-           msg->block_count > 0 &&
-           msg->block_count <= ESPNOW_MESH_HIL_PATCH_MAX_BLOCKS &&
-           msg->block_index < msg->block_count;
-}
-
-static bool patch_block_packet_valid(const espnow_mesh_patch_block_msg_t *msg, uint16_t len)
-{
-    if (len < offsetof(espnow_mesh_patch_block_msg_t, payload)) {
-        return false;
-    }
-    if (!mesh_packet_valid(msg, len, ESPNOW_MESH_MSG_PATCH_BLOCK)) {
-        return false;
-    }
     if (msg->payload_len == 0 || msg->payload_len > sizeof(msg->payload)) {
         return false;
     }
@@ -863,18 +465,20 @@ static bool patch_block_packet_valid(const espnow_mesh_patch_block_msg_t *msg, u
     }
     return len >= offsetof(espnow_mesh_patch_block_msg_t, payload) + msg->payload_len;
 }
-
-static bool patch_ready_packet_valid(const espnow_mesh_patch_ready_msg_t *msg, uint16_t len)
+#else
+static bool patch_block_req_fields_valid(const espnow_mesh_patch_block_req_msg_t *msg)
 {
-    return len >= sizeof(*msg) && mesh_packet_valid(msg, len, ESPNOW_MESH_MSG_PATCH_READY) &&
-           msg->total_len > 0 && msg->total_len <= CONFIG_ESPNOW_MESH_HIL_PATCH_BYTES &&
+    return msg->block_count > 0 &&
+           msg->block_count <= ESPNOW_MESH_HIL_PATCH_MAX_BLOCKS &&
+           msg->block_index < msg->block_count;
+}
+
+static bool patch_ready_fields_valid(const espnow_mesh_patch_ready_msg_t *msg)
+{
+    return msg->total_len > 0 && msg->total_len <= CONFIG_ESPNOW_MESH_HIL_PATCH_BYTES &&
            msg->blocks_received <= ESPNOW_MESH_HIL_PATCH_MAX_BLOCKS;
 }
-
-static bool patch_apply_packet_valid(const espnow_mesh_patch_apply_msg_t *msg, uint16_t len)
-{
-    return len >= sizeof(*msg) && mesh_packet_valid(msg, len, ESPNOW_MESH_MSG_PATCH_APPLY);
-}
+#endif
 
 static uint8_t hil_patch_byte(uint32_t patch_id, uint32_t offset)
 {
@@ -906,18 +510,19 @@ static uint32_t hil_patch_hash(uint32_t patch_id, uint32_t total_len)
     return hash;
 }
 
+static uint16_t hil_patch_block_count_for_len(uint32_t total_len)
+{
+    return (uint16_t)((total_len + CONFIG_ESPNOW_MESH_HIL_PATCH_BLOCK_BYTES - 1u) /
+                      CONFIG_ESPNOW_MESH_HIL_PATCH_BLOCK_BYTES);
+}
+
+#if CONFIG_ESPNOW_MESH_ROLE_CONTROLLER
 static void hil_fill_patch_block(uint32_t patch_id, uint32_t offset, uint8_t *payload,
                                  uint16_t payload_len)
 {
     for (uint16_t i = 0; i < payload_len; ++i) {
         payload[i] = hil_patch_byte(patch_id, offset + i);
     }
-}
-
-static uint16_t hil_patch_block_count_for_len(uint32_t total_len)
-{
-    return (uint16_t)((total_len + CONFIG_ESPNOW_MESH_HIL_PATCH_BLOCK_BYTES - 1u) /
-                      CONFIG_ESPNOW_MESH_HIL_PATCH_BLOCK_BYTES);
 }
 
 static uint16_t hil_patch_payload_len_for_block(uint16_t block_index, uint32_t total_len)
@@ -932,33 +537,23 @@ static uint16_t hil_patch_payload_len_for_block(uint16_t block_index, uint32_t t
                           : remaining);
 }
 #endif
+#endif
 
 #if CONFIG_ESPNOW_MESH_ROLE_CONTROLLER
 
+/*
+ * The satellite table is owned by the mesh task. The lock only orders slot
+ * claiming against espnow_mesh_get_status(), which snapshots the table from
+ * other tasks; per-field counter updates are read without it and are
+ * eventually consistent.
+ */
 static satellite_node_t s_satellites[CONFIG_ESPNOW_MESH_MAX_SATELLITES];
+static portMUX_TYPE s_satellite_table_lock = portMUX_INITIALIZER_UNLOCKED;
 static uint32_t s_controller_active_sequence;
 static uint32_t s_controller_last_sequence;
 static uint32_t s_controller_last_expected;
 static uint32_t s_controller_last_acked;
 static bool s_controller_last_sequence_complete;
-
-#if CONFIG_ESPNOW_MESH_SYNC_OUTPUT_ENABLE
-static bool shared_clock_get_time_us(int64_t *mesh_time_us)
-{
-    *mesh_time_us = (int64_t)now_us();
-    return true;
-}
-#endif
-
-static bool ack_packet_valid(const espnow_mesh_ack_msg_t *msg, uint16_t len)
-{
-    return len >= sizeof(*msg) && mesh_packet_valid(msg, len, ESPNOW_MESH_MSG_ACK);
-}
-
-static bool time_req_packet_valid(const espnow_mesh_time_req_msg_t *msg, uint16_t len)
-{
-    return len >= sizeof(*msg) && mesh_packet_valid(msg, len, ESPNOW_MESH_MSG_TIME_REQ);
-}
 
 #if CONFIG_ESPNOW_MESH_HIL_TEST_ENABLE
 static uint16_t s_hil_time_resp_drop_pct;
@@ -976,6 +571,19 @@ static int find_satellite(const uint8_t *mac)
     return -1;
 }
 
+#if CONFIG_ESPNOW_MESH_HIL_TEST_ENABLE
+static int known_satellite_count(void)
+{
+    int known = 0;
+    for (int i = 0; i < CONFIG_ESPNOW_MESH_MAX_SATELLITES; ++i) {
+        if (s_satellites[i].used) {
+            known++;
+        }
+    }
+    return known;
+}
+#endif
+
 static int find_or_add_satellite(const uint8_t *mac)
 {
     int index = find_satellite(mac);
@@ -985,8 +593,13 @@ static int find_or_add_satellite(const uint8_t *mac)
 
     for (int i = 0; i < CONFIG_ESPNOW_MESH_MAX_SATELLITES; ++i) {
         if (!s_satellites[i].used) {
-            s_satellites[i].used = true;
+            portENTER_CRITICAL(&s_satellite_table_lock);
             memcpy(s_satellites[i].mac, mac, ESP_NOW_ETH_ALEN);
+            s_satellites[i].used = true;
+            portEXIT_CRITICAL(&s_satellite_table_lock);
+            /* Seed the freshness timestamp so the new entry is not immediately
+             * eligible for expiry before its first ACK/time-request lands. */
+            s_satellites[i].last_seen_ms = now_ms();
             ESP_LOGI(TAG, "discovered satellite " MACSTR, MAC2STR(mac));
             if (s_espnow_ready) {
                 esp_err_t err = add_peer_if_needed(mac);
@@ -1003,6 +616,7 @@ static int find_or_add_satellite(const uint8_t *mac)
     return -1;
 }
 
+#if CONFIG_ESPNOW_MESH_REGISTRATION_AP_ENABLE
 static void controller_note_registered_satellite(const uint8_t *mac)
 {
     int index = find_or_add_satellite(mac);
@@ -1013,6 +627,7 @@ static void controller_note_registered_satellite(const uint8_t *mac)
     s_satellites[index].last_seen_ms = now_ms();
     ESP_LOGI(TAG, "registration AP learned satellite " MACSTR, MAC2STR(mac));
 }
+#endif
 
 static uint32_t retry_jitter_ms(uint32_t sequence, int satellite_index, uint32_t attempt)
 {
@@ -1040,6 +655,7 @@ static void schedule_next_retry(satellite_node_t *node, int satellite_index, uin
                                 uint32_t current_ms)
 {
     uint32_t jitter_ms = retry_jitter_ms(sequence, satellite_index, node->sends_current);
+    node->retry_scheduled = true;
     node->next_retry_ms = current_ms + node->retry_backoff_ms + jitter_ms;
 
     uint32_t next_backoff_ms = node->retry_backoff_ms * 2;
@@ -1054,6 +670,7 @@ static void init_satellite_delivery_state(satellite_node_t *node, bool expected)
     node->expected_current = expected;
     node->acked_current = false;
     node->sends_current = 0;
+    node->retry_scheduled = false;
     node->next_retry_ms = 0;
     node->retry_backoff_ms = clamp_backoff_ms(CONFIG_ESPNOW_MESH_RELIABLE_INITIAL_BACKOFF_MS);
 }
@@ -1172,11 +789,11 @@ static void log_sequence_summary(uint32_t sequence)
 
 static void handle_time_request(const espnow_mesh_event_t *event)
 {
-    espnow_mesh_time_req_msg_t req = { 0 };
-    memcpy(&req, event->data, event->len < sizeof(req) ? event->len : sizeof(req));
-    if (!time_req_packet_valid(&req, event->len)) {
+    if (event->len < sizeof(espnow_mesh_time_req_msg_t)) {
         return;
     }
+    espnow_mesh_time_req_msg_t req = { 0 };
+    memcpy(&req, event->data, sizeof(req));
 
     int index = find_or_add_satellite(event->mac);
     if (index < 0) {
@@ -1222,21 +839,44 @@ static void handle_controller_event(const espnow_mesh_event_t *event, uint32_t a
         return;
     }
 
-    if (header_packet_valid(event, ESPNOW_MESH_MSG_TIME_REQ)) {
+#if CONFIG_ESPNOW_MESH_REGISTRATION_AP_ENABLE
+    if (event->type == ESPNOW_MESH_EVENT_REGISTRATION) {
+        controller_note_registered_satellite(event->mac);
+        return;
+    }
+#endif
+
+    uint8_t type = 0;
+    if (!mesh_rx_packet_type(event, &type)) {
+        return;
+    }
+
+    switch (type) {
+    case ESPNOW_MESH_MSG_TIME_REQ:
         handle_time_request(event);
-        return;
+        break;
+    case ESPNOW_MESH_MSG_ACK: {
+        if (event->len < sizeof(espnow_mesh_ack_msg_t)) {
+            break;
+        }
+        espnow_mesh_ack_msg_t ack = { 0 };
+        memcpy(&ack, event->data, sizeof(ack));
+        note_ack(event->mac, &ack, active_sequence);
+        break;
     }
-
-    espnow_mesh_ack_msg_t ack = { 0 };
-    memcpy(&ack, event->data, event->len < sizeof(ack) ? event->len : sizeof(ack));
-    if (!ack_packet_valid(&ack, event->len)) {
-        return;
+    default:
+        break;
     }
-
-    note_ack(event->mac, &ack, active_sequence);
 }
 
-static void drain_controller_events_until(uint32_t deadline_ms, uint32_t active_sequence)
+/*
+ * Drain and dispatch queued events until the deadline, waking at least every
+ * 100 ms so time-based retry scheduling stays responsive. The event handler
+ * differs between the normal controller loop and the HIL loop, so it is passed
+ * in; sequence is forwarded to the handler as its active-sequence argument.
+ */
+static void drain_events_until(uint32_t deadline_ms, uint32_t sequence,
+                               void (*handler)(const espnow_mesh_event_t *, uint32_t))
 {
     while (true) {
         uint32_t current_ms = now_ms();
@@ -1251,9 +891,14 @@ static void drain_controller_events_until(uint32_t deadline_ms, uint32_t active_
 
         espnow_mesh_event_t event = { 0 };
         if (xQueueReceive(s_event_queue, &event, pdMS_TO_TICKS(wait_ms)) == pdTRUE) {
-            handle_controller_event(&event, active_sequence);
+            handler(&event, sequence);
         }
     }
+}
+
+static void drain_controller_events_until(uint32_t deadline_ms, uint32_t active_sequence)
+{
+    drain_events_until(deadline_ms, active_sequence, handle_controller_event);
 }
 
 static esp_err_t send_controller_packet(const uint8_t *dest_mac, uint32_t sequence,
@@ -1326,7 +971,7 @@ static bool send_due_unicast_retries(uint32_t sequence, uint32_t *next_retry_ms)
         }
 
         retryable_missing = true;
-        if (node->next_retry_ms == 0 || retry_time_due(current_ms, node->next_retry_ms)) {
+        if (!node->retry_scheduled || retry_time_due(current_ms, node->next_retry_ms)) {
             uint32_t attempt = node->sends_current + 1;
             esp_err_t err = add_peer_if_needed(node->mac);
             if (err == ESP_OK) {
@@ -1345,7 +990,7 @@ static bool send_due_unicast_retries(uint32_t sequence, uint32_t *next_retry_ms)
             schedule_next_retry(node, i, sequence, current_ms);
         }
 
-        if (node->next_retry_ms < *next_retry_ms) {
+        if (node->retry_scheduled && node->next_retry_ms < *next_retry_ms) {
             *next_retry_ms = node->next_retry_ms;
         }
     }
@@ -1475,6 +1120,7 @@ static void hil_reset_ack_state(void)
         node->hil_acked_current = false;
         node->hil_patch_ready_current = false;
         node->hil_sends_current = 0;
+        node->retry_scheduled = false;
         node->next_retry_ms = 0;
         node->retry_backoff_ms = clamp_backoff_ms(CONFIG_ESPNOW_MESH_RELIABLE_INITIAL_BACKOFF_MS);
     }
@@ -1636,9 +1282,12 @@ static esp_err_t hil_send_patch_block(const uint8_t *dest_mac,
 
 static void hil_handle_patch_block_request(const espnow_mesh_event_t *event, uint32_t sequence)
 {
+    if (event->len < sizeof(espnow_mesh_patch_block_req_msg_t)) {
+        return;
+    }
     espnow_mesh_patch_block_req_msg_t req = { 0 };
-    memcpy(&req, event->data, event->len < sizeof(req) ? event->len : sizeof(req));
-    if (!patch_block_req_packet_valid(&req, event->len)) {
+    memcpy(&req, event->data, sizeof(req));
+    if (!patch_block_req_fields_valid(&req)) {
         return;
     }
     if (req.sequence != sequence || req.controller_boot_id != s_boot_id) {
@@ -1679,9 +1328,12 @@ static void hil_handle_patch_block_request(const espnow_mesh_event_t *event, uin
 
 static void hil_note_patch_ready(const espnow_mesh_event_t *event, uint32_t sequence)
 {
+    if (event->len < sizeof(espnow_mesh_patch_ready_msg_t)) {
+        return;
+    }
     espnow_mesh_patch_ready_msg_t ready = { 0 };
-    memcpy(&ready, event->data, event->len < sizeof(ready) ? event->len : sizeof(ready));
-    if (!patch_ready_packet_valid(&ready, event->len)) {
+    memcpy(&ready, event->data, sizeof(ready));
+    if (!patch_ready_fields_valid(&ready)) {
         return;
     }
     if (ready.sequence != sequence || ready.controller_boot_id != s_boot_id ||
@@ -1736,54 +1388,55 @@ static void hil_handle_controller_event(const espnow_mesh_event_t *event, uint32
         return;
     }
 
-    if (header_packet_valid(event, ESPNOW_MESH_MSG_TIME_REQ)) {
+#if CONFIG_ESPNOW_MESH_REGISTRATION_AP_ENABLE
+    if (event->type == ESPNOW_MESH_EVENT_REGISTRATION) {
+        controller_note_registered_satellite(event->mac);
+        return;
+    }
+#endif
+
+    uint8_t type = 0;
+    if (!mesh_rx_packet_type(event, &type)) {
+        return;
+    }
+
+    switch (type) {
+    case ESPNOW_MESH_MSG_TIME_REQ:
         handle_time_request(event);
-        return;
-    }
-
-    if (header_packet_valid(event, ESPNOW_MESH_MSG_PATCH_BLOCK_REQ)) {
+        break;
+    case ESPNOW_MESH_MSG_PATCH_BLOCK_REQ:
         hil_handle_patch_block_request(event, sequence);
-        return;
-    }
-
-    if (header_packet_valid(event, ESPNOW_MESH_MSG_PATCH_READY)) {
+        break;
+    case ESPNOW_MESH_MSG_PATCH_READY:
         hil_note_patch_ready(event, sequence);
-        return;
-    }
-
-    if (header_packet_valid(event, ESPNOW_MESH_MSG_HIL_ACK)) {
+        break;
+    case ESPNOW_MESH_MSG_HIL_ACK: {
+        if (event->len < sizeof(espnow_mesh_hil_ack_msg_t)) {
+            break;
+        }
         espnow_mesh_hil_ack_msg_t ack = { 0 };
-        memcpy(&ack, event->data, event->len < sizeof(ack) ? event->len : sizeof(ack));
-        if (hil_ack_packet_valid(&ack, event->len)) {
-            hil_note_ack(event->mac, &ack, sequence);
-        }
-        return;
+        memcpy(&ack, event->data, sizeof(ack));
+        hil_note_ack(event->mac, &ack, sequence);
+        break;
     }
-
-    if (header_packet_valid(event, ESPNOW_MESH_MSG_ACK)) {
-        espnow_mesh_ack_msg_t ack = { 0 };
-        memcpy(&ack, event->data, event->len < sizeof(ack) ? event->len : sizeof(ack));
-        if (ack_packet_valid(&ack, event->len)) {
-            int index = find_or_add_satellite(event->mac);
-            if (index >= 0) {
-                s_satellites[index].last_seen_ms = now_ms();
-            }
+    case ESPNOW_MESH_MSG_ACK: {
+        if (event->len < sizeof(espnow_mesh_ack_msg_t)) {
+            break;
         }
+        int index = find_or_add_satellite(event->mac);
+        if (index >= 0) {
+            s_satellites[index].last_seen_ms = now_ms();
+        }
+        break;
+    }
+    default:
+        break;
     }
 }
 
 static void hil_drain_until(uint32_t deadline_ms, uint32_t sequence)
 {
-    while ((int32_t)(deadline_ms - now_ms()) > 0) {
-        uint32_t wait_ms = deadline_ms - now_ms();
-        if (wait_ms > 100) {
-            wait_ms = 100;
-        }
-        espnow_mesh_event_t event = { 0 };
-        if (xQueueReceive(s_event_queue, &event, pdMS_TO_TICKS(wait_ms)) == pdTRUE) {
-            hil_handle_controller_event(&event, sequence);
-        }
-    }
+    drain_events_until(deadline_ms, sequence, hil_handle_controller_event);
 }
 
 static esp_err_t hil_send_cmd(const uint8_t *dest_mac, const hil_case_t *hil_case,
@@ -1849,7 +1502,7 @@ static void hil_send_retries_until_done(const hil_case_t *hil_case, uint32_t seq
                 continue;
             }
 
-            if (node->next_retry_ms == 0 || retry_time_due(current_ms, node->next_retry_ms)) {
+            if (!node->retry_scheduled || retry_time_due(current_ms, node->next_retry_ms)) {
                 uint32_t attempt = node->hil_sends_current + 1;
                 esp_err_t err = add_peer_if_needed(node->mac);
                 if (err == ESP_OK) {
@@ -1861,7 +1514,7 @@ static void hil_send_retries_until_done(const hil_case_t *hil_case, uint32_t seq
                          sequence, attempt, MAC2STR(node->mac), esp_err_to_name(err));
                 schedule_next_retry(node, i, sequence, current_ms);
             }
-            if (node->next_retry_ms != 0 && (int32_t)(node->next_retry_ms - next_retry_ms) < 0) {
+            if (node->retry_scheduled && (int32_t)(node->next_retry_ms - next_retry_ms) < 0) {
                 next_retry_ms = node->next_retry_ms;
             }
         }
@@ -1888,6 +1541,7 @@ static void hil_run_case(const hil_case_t *hil_case, uint32_t sequence)
             CONFIG_ESPNOW_MESH_HIL_CASE_GAP_MS;
     } else {
         s_hil_time_resp_drop_pct = 0;
+        s_hil_time_resp_drop_seed = 0;
         s_hil_time_resp_drop_until_ms = 0;
     }
 
@@ -1993,19 +1647,16 @@ static void hil_controller_run(void)
     while ((int32_t)(settle_deadline - now_ms()) > 0) {
         (void)send_controller_packet(BROADCAST_MAC, 1, 1);
         hil_drain_until(now_ms() + 300, 1);
-        if (find_satellite(s_self_mac) >= 0) {
+        if (known_satellite_count() >= CONFIG_ESPNOW_MESH_HIL_EXPECTED_SATELLITES) {
             break;
         }
     }
+    /* Even with all expected satellites discovered, give them one settle window
+     * for time-sync exchanges before the first case fires. */
     hil_drain_until(now_ms() + CONFIG_ESPNOW_MESH_HIL_DISCOVERY_MS, 1);
 
-    int known = 0;
-    for (int i = 0; i < CONFIG_ESPNOW_MESH_MAX_SATELLITES; ++i) {
-        if (s_satellites[i].used) {
-            known++;
-        }
-    }
-    ESP_LOGI(TAG, "HIL discovery complete known_satellites=%d", known);
+    ESP_LOGI(TAG, "HIL discovery complete known_satellites=%d expected=%d",
+             known_satellite_count(), CONFIG_ESPNOW_MESH_HIL_EXPECTED_SATELLITES);
 
     uint32_t sequence = 1;
     for (uint32_t i = 0; i < sizeof(HIL_CASES) / sizeof(HIL_CASES[0]); ++i) {
@@ -2020,8 +1671,40 @@ static void hil_controller_run(void)
              (unsigned)((sizeof(HIL_CASES) / sizeof(HIL_CASES[0])) +
                         (sizeof(PATCH_HIL_CASES) / sizeof(PATCH_HIL_CASES[0]))));
     while (true) {
+        log_event_queue_drops_if_any();
         hil_drain_until(now_ms() + 1000, 0);
     }
+}
+#endif
+
+#if !CONFIG_ESPNOW_MESH_HIL_TEST_ENABLE
+/*
+ * Free satellite slots that have gone silent past the configured window. This
+ * stops the controller from retrying (and holding the ACK deadline for) nodes
+ * that have permanently left, and returns their peer and table slots. Runs on
+ * the mesh task at the top of each sequence.
+ */
+static void expire_stale_satellites(void)
+{
+#if CONFIG_ESPNOW_MESH_SATELLITE_EXPIRE_MS > 0
+    uint32_t current_ms = now_ms();
+    for (int i = 0; i < CONFIG_ESPNOW_MESH_MAX_SATELLITES; ++i) {
+        satellite_node_t *node = &s_satellites[i];
+        if (!node->used ||
+            (int32_t)(current_ms - node->last_seen_ms) < CONFIG_ESPNOW_MESH_SATELLITE_EXPIRE_MS) {
+            continue;
+        }
+
+        ESP_LOGW(TAG, "evicting stale satellite " MACSTR " last_seen=%" PRIu32 "ms ago",
+                 MAC2STR(node->mac), current_ms - node->last_seen_ms);
+        if (s_espnow_ready) {
+            (void)esp_now_del_peer(node->mac);
+        }
+        portENTER_CRITICAL(&s_satellite_table_lock);
+        memset(node, 0, sizeof(*node));
+        portEXIT_CRITICAL(&s_satellite_table_lock);
+    }
+#endif
 }
 #endif
 
@@ -2034,6 +1717,8 @@ static void controller_run(void)
     uint32_t sequence = 0;
 
     while (true) {
+        log_event_queue_drops_if_any();
+        expire_stale_satellites();
         sequence++;
         if (sequence == 0) {
             sequence = 1;
@@ -2086,21 +1771,13 @@ static uint32_t s_controller_boot_id;
 static bool s_have_last_sequence;
 static uint32_t s_last_sequence;
 static uint32_t s_next_time_sync_ms;
+#if CONFIG_ESPNOW_MESH_CONTROLLER_TIMEOUT_MS > 0
+static uint32_t s_last_controller_rx_ms;
+#endif
 static uint32_t s_time_sync_sequence;
 static uint32_t s_pending_time_sync_sequence;
 static uint64_t s_pending_time_sync_tx_us;
 static bool s_have_pending_time_sync;
-static portMUX_TYPE s_mesh_time_lock = portMUX_INITIALIZER_UNLOCKED;
-static bool s_have_mesh_time;
-static int64_t s_mesh_time_offset_us;
-#if CONFIG_ESPNOW_MESH_TIME_SYNC_PLL_ENABLE
-static int64_t s_pll_anchor_local_us;
-static int64_t s_pll_anchor_mesh_us;
-static int32_t s_pll_freq_ppb;
-static int64_t s_pll_best_delay_us;
-static uint32_t s_pll_accepted_samples;
-static uint32_t s_pll_consecutive_rejects;
-#endif
 #if CONFIG_ESPNOW_MESH_HIL_TEST_ENABLE
 static bool s_have_last_hil_sequence;
 static uint32_t s_last_hil_sequence;
@@ -2125,7 +1802,6 @@ static bool s_patch_offer_active;
 static bool s_patch_ready;
 #endif
 
-static int64_t mesh_time_us(void);
 
 #if CONFIG_ESPNOW_MESH_HIL_TEST_ENABLE
 static void hil_patch_reset_staging(void)
@@ -2311,9 +1987,12 @@ static void hil_patch_request_next_missing(const uint8_t *controller_mac)
 
 static void handle_satellite_patch_offer(const espnow_mesh_event_t *event)
 {
+    if (event->len < sizeof(espnow_mesh_patch_offer_msg_t)) {
+        return;
+    }
     espnow_mesh_patch_offer_msg_t offer = { 0 };
-    memcpy(&offer, event->data, event->len < sizeof(offer) ? event->len : sizeof(offer));
-    if (!patch_offer_packet_valid(&offer, event->len)) {
+    memcpy(&offer, event->data, sizeof(offer));
+    if (!patch_offer_fields_valid(&offer)) {
         return;
     }
     if (offer.block_count != hil_patch_block_count_for_len(offer.total_len) ||
@@ -2358,9 +2037,12 @@ static void handle_satellite_patch_offer(const espnow_mesh_event_t *event)
 
 static void handle_satellite_patch_block(const espnow_mesh_event_t *event)
 {
+    if (event->len < offsetof(espnow_mesh_patch_block_msg_t, payload)) {
+        return;
+    }
     espnow_mesh_patch_block_msg_t block = { 0 };
     memcpy(&block, event->data, event->len < sizeof(block) ? event->len : sizeof(block));
-    if (!patch_block_packet_valid(&block, event->len)) {
+    if (!patch_block_fields_valid(&block, event->len)) {
         return;
     }
     if (!s_patch_offer_active || !s_have_controller || !mac_equal(event->mac, s_controller_mac)) {
@@ -2424,11 +2106,11 @@ static void handle_satellite_patch_block(const espnow_mesh_event_t *event)
 
 static void handle_satellite_patch_apply(const espnow_mesh_event_t *event)
 {
-    espnow_mesh_patch_apply_msg_t apply = { 0 };
-    memcpy(&apply, event->data, event->len < sizeof(apply) ? event->len : sizeof(apply));
-    if (!patch_apply_packet_valid(&apply, event->len)) {
+    if (event->len < sizeof(espnow_mesh_patch_apply_msg_t)) {
         return;
     }
+    espnow_mesh_patch_apply_msg_t apply = { 0 };
+    memcpy(&apply, event->data, sizeof(apply));
     if (!hil_accept_controller_from_event(event, apply.controller_boot_id, "patch apply")) {
         return;
     }
@@ -2452,14 +2134,8 @@ static void handle_satellite_patch_apply(const espnow_mesh_event_t *event)
 }
 #endif
 
-static bool data_packet_valid(const espnow_mesh_data_msg_t *msg, uint16_t len)
+static bool data_msg_fields_valid(const espnow_mesh_data_msg_t *msg, uint16_t len)
 {
-    if (len < offsetof(espnow_mesh_data_msg_t, payload)) {
-        return false;
-    }
-    if (!mesh_packet_valid(msg, len, ESPNOW_MESH_MSG_DATA)) {
-        return false;
-    }
     if (msg->payload_len > sizeof(msg->payload)) {
         return false;
     }
@@ -2514,186 +2190,6 @@ static esp_err_t send_satellite_hil_ack(const uint8_t *controller_mac,
     return mesh_send(controller_mac, &ack, sizeof(ack), ESPNOW_MESH_MSG_HIL_ACK);
 }
 #endif
-
-#if CONFIG_ESPNOW_MESH_TIME_SYNC_PLL_ENABLE
-static int64_t abs_i64(int64_t value)
-{
-    return value < 0 ? -value : value;
-}
-
-static int32_t clamp_i64_to_i32(int64_t value, int32_t min_value, int32_t max_value)
-{
-    if (value < min_value) {
-        return min_value;
-    }
-    if (value > max_value) {
-        return max_value;
-    }
-    return (int32_t)value;
-}
-
-static int64_t pll_predict_mesh_time_us(int64_t local_time_us, int64_t anchor_local_us,
-                                        int64_t anchor_mesh_us, int32_t freq_ppb)
-{
-    int64_t local_delta_us = local_time_us - anchor_local_us;
-    int64_t freq_adjust_us = (local_delta_us * (int64_t)freq_ppb) / 1000000000LL;
-    return anchor_mesh_us + local_delta_us + freq_adjust_us;
-}
-
-static void pll_reset_locked(int64_t sample_local_us, int64_t sample_mesh_us,
-                             int64_t sample_offset_us, int64_t delay_us)
-{
-    s_have_mesh_time = true;
-    s_mesh_time_offset_us = sample_offset_us;
-    s_pll_anchor_local_us = sample_local_us;
-    s_pll_anchor_mesh_us = sample_mesh_us;
-    s_pll_freq_ppb = 0;
-    s_pll_best_delay_us = delay_us;
-    s_pll_accepted_samples = 1;
-    s_pll_consecutive_rejects = 0;
-}
-
-typedef struct {
-    bool accepted;
-    bool reacquired;
-    const char *reject_reason;
-    int64_t residual_us;
-    int64_t phase_step_us;
-    int64_t offset_us;
-    int64_t best_delay_us;
-    int32_t freq_ppb;
-    uint32_t accepted_samples;
-    uint32_t consecutive_rejects;
-} pll_update_result_t;
-
-static pll_update_result_t pll_update_from_sample(int64_t sample_local_us,
-                                                  int64_t sample_mesh_us,
-                                                  int64_t sample_offset_us,
-                                                  int64_t delay_us)
-{
-    pll_update_result_t result = { 0 };
-
-    portENTER_CRITICAL(&s_mesh_time_lock);
-
-    bool reacquire = !s_have_mesh_time ||
-                     s_pll_consecutive_rejects >= CONFIG_ESPNOW_MESH_TIME_SYNC_PLL_RESET_AFTER_REJECTS;
-    if (reacquire) {
-        pll_reset_locked(sample_local_us, sample_mesh_us, sample_offset_us, delay_us);
-        result.accepted = true;
-        result.reacquired = true;
-        result.offset_us = s_mesh_time_offset_us;
-        result.best_delay_us = s_pll_best_delay_us;
-        result.freq_ppb = s_pll_freq_ppb;
-        result.accepted_samples = s_pll_accepted_samples;
-        portEXIT_CRITICAL(&s_mesh_time_lock);
-        return result;
-    }
-
-    if (delay_us < s_pll_best_delay_us) {
-        s_pll_best_delay_us = delay_us;
-    }
-
-    int64_t predicted_mesh_us =
-        pll_predict_mesh_time_us(sample_local_us, s_pll_anchor_local_us,
-                                 s_pll_anchor_mesh_us, s_pll_freq_ppb);
-    int64_t residual_us = sample_mesh_us - predicted_mesh_us;
-    bool startup = s_pll_accepted_samples < CONFIG_ESPNOW_MESH_TIME_SYNC_PLL_LOCK_SAMPLES;
-    bool delay_outlier =
-        !startup &&
-        delay_us > s_pll_best_delay_us + CONFIG_ESPNOW_MESH_TIME_SYNC_PLL_DELAY_MARGIN_US;
-    bool residual_outlier =
-        !startup && abs_i64(residual_us) > CONFIG_ESPNOW_MESH_TIME_SYNC_PLL_OUTLIER_US;
-
-    result.residual_us = residual_us;
-    result.best_delay_us = s_pll_best_delay_us;
-    result.freq_ppb = s_pll_freq_ppb;
-    result.accepted_samples = s_pll_accepted_samples;
-
-    if (delay_outlier || residual_outlier) {
-        s_pll_consecutive_rejects++;
-        result.reject_reason = delay_outlier ? "delay" : "residual";
-        result.consecutive_rejects = s_pll_consecutive_rejects;
-        portEXIT_CRITICAL(&s_mesh_time_lock);
-        return result;
-    }
-
-    int64_t phase_divisor = 1LL << CONFIG_ESPNOW_MESH_TIME_SYNC_PLL_PHASE_GAIN_SHIFT;
-    int64_t phase_step_us = residual_us / phase_divisor;
-    int64_t corrected_mesh_us = predicted_mesh_us + phase_step_us;
-
-    int64_t local_delta_us = sample_local_us - s_pll_anchor_local_us;
-    if (local_delta_us > 0) {
-        int64_t freq_error_ppb = (residual_us * 1000000000LL) / local_delta_us;
-        int64_t freq_divisor = 1LL << CONFIG_ESPNOW_MESH_TIME_SYNC_PLL_FREQ_GAIN_SHIFT;
-        int64_t freq_adjust_ppb = freq_error_ppb / freq_divisor;
-        int64_t next_freq_ppb = (int64_t)s_pll_freq_ppb + freq_adjust_ppb;
-        s_pll_freq_ppb =
-            clamp_i64_to_i32(next_freq_ppb, -CONFIG_ESPNOW_MESH_TIME_SYNC_PLL_MAX_FREQ_PPB,
-                             CONFIG_ESPNOW_MESH_TIME_SYNC_PLL_MAX_FREQ_PPB);
-    }
-
-    s_pll_anchor_local_us = sample_local_us;
-    s_pll_anchor_mesh_us = corrected_mesh_us;
-    s_mesh_time_offset_us = corrected_mesh_us - sample_local_us;
-    s_pll_accepted_samples++;
-    s_pll_consecutive_rejects = 0;
-
-    result.accepted = true;
-    result.phase_step_us = phase_step_us;
-    result.offset_us = s_mesh_time_offset_us;
-    result.best_delay_us = s_pll_best_delay_us;
-    result.freq_ppb = s_pll_freq_ppb;
-    result.accepted_samples = s_pll_accepted_samples;
-    portEXIT_CRITICAL(&s_mesh_time_lock);
-
-    return result;
-}
-#endif
-
-#if CONFIG_ESPNOW_MESH_SYNC_OUTPUT_ENABLE
-static bool shared_clock_get_time_us(int64_t *mesh_time_us)
-{
-    int64_t local_time_us = (int64_t)now_us();
-    bool have_mesh_time = false;
-#if CONFIG_ESPNOW_MESH_TIME_SYNC_PLL_ENABLE
-    int64_t anchor_local_us = 0;
-    int64_t anchor_mesh_us = 0;
-    int32_t freq_ppb = 0;
-#else
-    int64_t offset_us = 0;
-#endif
-
-    portENTER_CRITICAL(&s_mesh_time_lock);
-    have_mesh_time = s_have_mesh_time;
-#if CONFIG_ESPNOW_MESH_TIME_SYNC_PLL_ENABLE
-    anchor_local_us = s_pll_anchor_local_us;
-    anchor_mesh_us = s_pll_anchor_mesh_us;
-    freq_ppb = s_pll_freq_ppb;
-#else
-    offset_us = s_mesh_time_offset_us;
-#endif
-    portEXIT_CRITICAL(&s_mesh_time_lock);
-
-#if CONFIG_ESPNOW_MESH_TIME_SYNC_PLL_ENABLE
-    *mesh_time_us = pll_predict_mesh_time_us(local_time_us, anchor_local_us, anchor_mesh_us,
-                                             freq_ppb);
-#else
-    *mesh_time_us = local_time_us + offset_us;
-#endif
-    return have_mesh_time;
-}
-#endif
-
-static int64_t mesh_time_us(void)
-{
-    int64_t shared_us = 0;
-#if CONFIG_ESPNOW_MESH_SYNC_OUTPUT_ENABLE
-    (void)shared_clock_get_time_us(&shared_us);
-#else
-    shared_us = (int64_t)now_us() + s_mesh_time_offset_us;
-#endif
-    return shared_us;
-}
 
 static void request_time_sync_if_due(void)
 {
@@ -2941,18 +2437,13 @@ static TickType_t satellite_wait_ticks(void)
 }
 #endif
 
-static bool time_resp_packet_valid(const espnow_mesh_time_resp_msg_t *msg, uint16_t len)
-{
-    return len >= sizeof(*msg) && mesh_packet_valid(msg, len, ESPNOW_MESH_MSG_TIME_RESP);
-}
-
 static void handle_time_response(const espnow_mesh_event_t *event)
 {
-    espnow_mesh_time_resp_msg_t resp = { 0 };
-    memcpy(&resp, event->data, event->len < sizeof(resp) ? event->len : sizeof(resp));
-    if (!time_resp_packet_valid(&resp, event->len)) {
+    if (event->len < sizeof(espnow_mesh_time_resp_msg_t)) {
         return;
     }
+    espnow_mesh_time_resp_msg_t resp = { 0 };
+    memcpy(&resp, event->data, sizeof(resp));
 
     if (!s_have_controller || !mac_equal(event->mac, s_controller_mac) ||
         !mac_equal(resp.controller_mac, s_controller_mac)) {
@@ -3009,18 +2500,7 @@ static void handle_time_response(const espnow_mesh_event_t *event)
              pll.phase_step_us, pll.offset_us, pll.freq_ppb, delay_us, pll.best_delay_us,
              pll.accepted_samples, mesh_time_us());
 #else
-    int64_t filtered_offset_us = 0;
-    portENTER_CRITICAL(&s_mesh_time_lock);
-    if (!s_have_mesh_time || CONFIG_ESPNOW_MESH_TIME_SYNC_FILTER_SHIFT == 0) {
-        s_mesh_time_offset_us = sample_offset_us;
-    } else {
-        int64_t divisor = 1LL << CONFIG_ESPNOW_MESH_TIME_SYNC_FILTER_SHIFT;
-        s_mesh_time_offset_us =
-            ((s_mesh_time_offset_us * (divisor - 1)) + sample_offset_us) / divisor;
-    }
-    s_have_mesh_time = true;
-    filtered_offset_us = s_mesh_time_offset_us;
-    portEXIT_CRITICAL(&s_mesh_time_lock);
+    int64_t filtered_offset_us = time_sync_apply_offset(sample_offset_us);
 
     ESP_LOGI(TAG,
              "time sync seq=%" PRIu32 " offset_sample=%" PRId64
@@ -3032,11 +2512,11 @@ static void handle_time_response(const espnow_mesh_event_t *event)
 #if CONFIG_ESPNOW_MESH_HIL_TEST_ENABLE
 static void handle_satellite_hil_command(const espnow_mesh_event_t *event)
 {
-    espnow_mesh_hil_cmd_msg_t cmd = { 0 };
-    memcpy(&cmd, event->data, event->len < sizeof(cmd) ? event->len : sizeof(cmd));
-    if (!hil_cmd_packet_valid(&cmd, event->len)) {
+    if (event->len < sizeof(espnow_mesh_hil_cmd_msg_t)) {
         return;
     }
+    espnow_mesh_hil_cmd_msg_t cmd = { 0 };
+    memcpy(&cmd, event->data, sizeof(cmd));
     if (!hil_softap_discovery_ready("HIL command")) {
         return;
     }
@@ -3075,7 +2555,8 @@ static void handle_satellite_hil_command(const espnow_mesh_event_t *event)
         return;
     }
 
-    bool duplicate = s_have_last_hil_sequence && cmd.sequence <= s_last_hil_sequence;
+    bool duplicate =
+        s_have_last_hil_sequence && (int32_t)(cmd.sequence - s_last_hil_sequence) <= 0;
     bool accepted = !duplicate;
     if (accepted) {
         s_have_last_hil_sequence = true;
@@ -3119,9 +2600,12 @@ static void handle_satellite_hil_command(const espnow_mesh_event_t *event)
 
 static void handle_satellite_data(const espnow_mesh_event_t *event)
 {
+    if (event->len < offsetof(espnow_mesh_data_msg_t, payload)) {
+        return;
+    }
     espnow_mesh_data_msg_t msg = { 0 };
     memcpy(&msg, event->data, event->len < sizeof(msg) ? event->len : sizeof(msg));
-    if (!data_packet_valid(&msg, event->len)) {
+    if (!data_msg_fields_valid(&msg, event->len)) {
         return;
     }
 #if CONFIG_ESPNOW_MESH_HIL_TEST_ENABLE
@@ -3154,7 +2638,8 @@ static void handle_satellite_data(const espnow_mesh_event_t *event)
         return;
     }
 
-    bool duplicate = s_have_last_sequence && msg.sequence <= s_last_sequence;
+    bool duplicate =
+        s_have_last_sequence && (int32_t)(msg.sequence - s_last_sequence) <= 0;
     bool accepted = !duplicate;
     if (accepted) {
         s_have_last_sequence = true;
@@ -3168,7 +2653,7 @@ static void handle_satellite_data(const espnow_mesh_event_t *event)
         memcpy(payload, msg.payload, copy_len);
         payload[CONFIG_ESPNOW_MESH_PAYLOAD_BYTES] = '\0';
 
-        if (s_have_mesh_time) {
+        if (mesh_have_time()) {
             ESP_LOGI(TAG,
                      "rx seq=%" PRIu32 " attempt=%" PRIu32
                      " rssi=%d mesh_time=%" PRId64 "us payload=\"%s\"",
@@ -3190,6 +2675,48 @@ static void handle_satellite_data(const espnow_mesh_event_t *event)
     }
 }
 
+#if CONFIG_ESPNOW_MESH_CONTROLLER_TIMEOUT_MS > 0
+/* Record that a valid frame was received from the locked controller. */
+static void note_controller_activity(void)
+{
+    s_last_controller_rx_ms = now_ms();
+}
+
+/*
+ * Drop the controller lock if nothing has been heard from it for the configured
+ * window. The boot-id and sequence dedup state are kept so a controller that is
+ * still alive on a new channel is re-adopted cleanly, while registration
+ * scanning resumes immediately to rediscover a controller that moved channels.
+ */
+static void check_controller_timeout(void)
+{
+    if (!s_have_controller) {
+        return;
+    }
+    if ((int32_t)(now_ms() - s_last_controller_rx_ms) <
+        CONFIG_ESPNOW_MESH_CONTROLLER_TIMEOUT_MS) {
+        return;
+    }
+
+    ESP_LOGW(TAG, "no controller traffic for %dms; dropping lock on " MACSTR
+                  " and resuming discovery",
+             CONFIG_ESPNOW_MESH_CONTROLLER_TIMEOUT_MS, MAC2STR(s_controller_mac));
+    s_have_controller = false;
+    s_have_pending_time_sync = false;
+#if CONFIG_ESPNOW_MESH_REGISTRATION_AP_ENABLE
+    s_next_registration_ms = now_ms();
+#endif
+}
+#else
+static void note_controller_activity(void)
+{
+}
+
+static void check_controller_timeout(void)
+{
+}
+#endif
+
 static void satellite_run(void)
 {
     ESP_LOGI(TAG, "running as satellite");
@@ -3200,6 +2727,8 @@ static void satellite_run(void)
 #endif
 
     while (true) {
+        log_event_queue_drops_if_any();
+        check_controller_timeout();
         request_time_sync_if_due();
         attempt_registration_if_due();
 
@@ -3215,163 +2744,42 @@ static void satellite_run(void)
             continue;
         }
 
-        if (header_packet_valid(&event, ESPNOW_MESH_MSG_TIME_RESP)) {
+        uint8_t type = 0;
+        if (!mesh_rx_packet_type(&event, &type)) {
+            continue;
+        }
+
+        switch (type) {
+        case ESPNOW_MESH_MSG_TIME_RESP:
             handle_time_response(&event);
+            break;
 #if CONFIG_ESPNOW_MESH_HIL_TEST_ENABLE
-        } else if (header_packet_valid(&event, ESPNOW_MESH_MSG_PATCH_OFFER)) {
+        case ESPNOW_MESH_MSG_PATCH_OFFER:
             handle_satellite_patch_offer(&event);
-        } else if (header_packet_valid(&event, ESPNOW_MESH_MSG_PATCH_BLOCK)) {
+            break;
+        case ESPNOW_MESH_MSG_PATCH_BLOCK:
             handle_satellite_patch_block(&event);
-        } else if (header_packet_valid(&event, ESPNOW_MESH_MSG_PATCH_APPLY)) {
+            break;
+        case ESPNOW_MESH_MSG_PATCH_APPLY:
             handle_satellite_patch_apply(&event);
-        } else if (header_packet_valid(&event, ESPNOW_MESH_MSG_HIL_CMD)) {
+            break;
+        case ESPNOW_MESH_MSG_HIL_CMD:
             handle_satellite_hil_command(&event);
+            break;
 #endif
-        } else {
+        case ESPNOW_MESH_MSG_DATA:
             handle_satellite_data(&event);
+            break;
+        default:
+            break;
+        }
+
+        if (s_have_controller && mac_equal(event.mac, s_controller_mac)) {
+            note_controller_activity();
         }
     }
 }
 
-#endif
-
-#if CONFIG_ESPNOW_MESH_HIL_TEST_ENABLE
-static void hil_marker_off_timer_cb(void *arg)
-{
-    (void)arg;
-    (void)gpio_set_level((gpio_num_t)CONFIG_ESPNOW_MESH_SYNC_OUTPUT_GPIO, 0);
-}
-
-static void hil_apply_timer_cb(void *arg)
-{
-    (void)arg;
-    hil_mark_apply();
-}
-
-static void init_hil_test(void)
-{
-    const esp_timer_create_args_t marker_off_args = {
-        .callback = hil_marker_off_timer_cb,
-        .name = "hil_mark_off",
-    };
-    ESP_ERROR_CHECK(esp_timer_create(&marker_off_args, &s_hil_marker_off_timer));
-
-    const esp_timer_create_args_t apply_args = {
-        .callback = hil_apply_timer_cb,
-        .name = "hil_apply",
-    };
-    ESP_ERROR_CHECK(esp_timer_create(&apply_args, &s_hil_apply_timer));
-}
-
-static void hil_mark_apply(void)
-{
-    (void)esp_timer_stop(s_hil_marker_off_timer);
-    (void)gpio_set_level((gpio_num_t)CONFIG_ESPNOW_MESH_SYNC_OUTPUT_GPIO, 1);
-    esp_err_t err =
-        esp_timer_start_once(s_hil_marker_off_timer, CONFIG_ESPNOW_MESH_HIL_MARK_PULSE_US);
-    if (err != ESP_OK && err != ESP_ERR_INVALID_STATE) {
-        ESP_LOGW(TAG, "HIL marker off schedule failed: %s", esp_err_to_name(err));
-    }
-}
-
-static void hil_schedule_apply_marker(int64_t apply_at_mesh_us)
-{
-    int64_t mesh_now_us = 0;
-    bool ready = shared_clock_get_time_us(&mesh_now_us);
-    int64_t delay_us = ready ? apply_at_mesh_us - mesh_now_us : 100000;
-    if (delay_us < 100) {
-        delay_us = 100;
-    }
-
-    (void)esp_timer_stop(s_hil_apply_timer);
-    esp_err_t err = esp_timer_start_once(s_hil_apply_timer, (uint64_t)delay_us);
-    if (err != ESP_OK) {
-        ESP_LOGW(TAG, "HIL apply marker schedule failed delay=%" PRId64 "us: %s",
-                 delay_us, esp_err_to_name(err));
-    }
-}
-#endif
-
-#if CONFIG_ESPNOW_MESH_SYNC_OUTPUT_ENABLE
-static void sync_output_schedule_us(int64_t delay_us)
-{
-    if (delay_us < 100) {
-        delay_us = 100;
-    }
-
-    esp_err_t err = esp_timer_start_once(s_sync_output_timer, (uint64_t)delay_us);
-    if (err == ESP_ERR_INVALID_STATE) {
-        (void)esp_timer_stop(s_sync_output_timer);
-        err = esp_timer_start_once(s_sync_output_timer, (uint64_t)delay_us);
-    }
-    if (err != ESP_OK) {
-        ESP_LOGW(TAG, "sync output timer schedule failed: %s", esp_err_to_name(err));
-    }
-}
-
-static void sync_output_timer_cb(void *arg)
-{
-    (void)arg;
-
-    int64_t mesh_now_us = 0;
-    bool clock_ready = shared_clock_get_time_us(&mesh_now_us);
-    if (!clock_ready && CONFIG_ESPNOW_MESH_SYNC_OUTPUT_REQUIRE_SYNC) {
-        (void)gpio_set_level((gpio_num_t)CONFIG_ESPNOW_MESH_SYNC_OUTPUT_GPIO, 0);
-        sync_output_schedule_us(10000);
-        return;
-    }
-
-    const int64_t period_us = CONFIG_ESPNOW_MESH_SYNC_OUTPUT_PERIOD_US;
-    const int64_t high_us = CONFIG_ESPNOW_MESH_SYNC_OUTPUT_HIGH_US;
-    int64_t phase_us = mesh_now_us % period_us;
-    if (phase_us < 0) {
-        phase_us += period_us;
-    }
-
-    int level = phase_us < high_us ? 1 : 0;
-    (void)gpio_set_level((gpio_num_t)CONFIG_ESPNOW_MESH_SYNC_OUTPUT_GPIO, level);
-
-    int64_t delay_to_transition_us = level ? (high_us - phase_us) : (period_us - phase_us);
-    sync_output_schedule_us(delay_to_transition_us);
-}
-
-static void init_sync_output(void)
-{
-    ESP_ERROR_CHECK(CONFIG_ESPNOW_MESH_SYNC_OUTPUT_HIGH_US >=
-                            CONFIG_ESPNOW_MESH_SYNC_OUTPUT_PERIOD_US
-                        ? ESP_ERR_INVALID_ARG
-                        : ESP_OK);
-    ESP_ERROR_CHECK(GPIO_IS_VALID_OUTPUT_GPIO(CONFIG_ESPNOW_MESH_SYNC_OUTPUT_GPIO)
-                        ? ESP_OK
-                        : ESP_ERR_INVALID_ARG);
-
-    gpio_config_t io_config = {
-        .pin_bit_mask = 1ULL << CONFIG_ESPNOW_MESH_SYNC_OUTPUT_GPIO,
-        .mode = GPIO_MODE_OUTPUT,
-        .pull_up_en = GPIO_PULLUP_DISABLE,
-        .pull_down_en = GPIO_PULLDOWN_ENABLE,
-        .intr_type = GPIO_INTR_DISABLE,
-    };
-    ESP_ERROR_CHECK(gpio_config(&io_config));
-    ESP_ERROR_CHECK(gpio_set_level((gpio_num_t)CONFIG_ESPNOW_MESH_SYNC_OUTPUT_GPIO, 0));
-
-    const esp_timer_create_args_t timer_args = {
-        .callback = sync_output_timer_cb,
-        .name = "sync_gpio",
-    };
-    ESP_ERROR_CHECK(esp_timer_create(&timer_args, &s_sync_output_timer));
-
-    ESP_LOGI(TAG,
-             "device_id=%d sync output gpio=%d period=%dus high=%dus require_sync=%d",
-             CONFIG_ESPNOW_MESH_DEVICE_ID, CONFIG_ESPNOW_MESH_SYNC_OUTPUT_GPIO,
-             CONFIG_ESPNOW_MESH_SYNC_OUTPUT_PERIOD_US, CONFIG_ESPNOW_MESH_SYNC_OUTPUT_HIGH_US,
-             CONFIG_ESPNOW_MESH_SYNC_OUTPUT_REQUIRE_SYNC ? 1 : 0);
-#if CONFIG_ESPNOW_MESH_HIL_TEST_ENABLE
-    ESP_LOGI(TAG, "HIL test mode owns sync output GPIO for apply markers");
-#else
-    sync_output_schedule_us(100);
-#endif
-}
 #endif
 
 espnow_mesh_role_runtime_t espnow_mesh_role(void)
@@ -3388,25 +2796,7 @@ bool espnow_mesh_get_time_us(int64_t *mesh_time_out_us)
     if (mesh_time_out_us == NULL) {
         return false;
     }
-
-#if CONFIG_ESPNOW_MESH_ROLE_CONTROLLER
-    *mesh_time_out_us = (int64_t)now_us();
-    return true;
-#else
-#if CONFIG_ESPNOW_MESH_SYNC_OUTPUT_ENABLE
     return shared_clock_get_time_us(mesh_time_out_us);
-#else
-    int64_t offset_us = 0;
-    bool have_mesh_time = false;
-    portENTER_CRITICAL(&s_mesh_time_lock);
-    have_mesh_time = s_have_mesh_time;
-    offset_us = s_mesh_time_offset_us;
-    portEXIT_CRITICAL(&s_mesh_time_lock);
-
-    *mesh_time_out_us = (int64_t)now_us() + offset_us;
-    return have_mesh_time;
-#endif
-#endif
 }
 
 bool espnow_mesh_is_time_synced(void)
@@ -3430,6 +2820,7 @@ bool espnow_mesh_get_status(espnow_mesh_status_t *status)
     status->channel = s_mesh_channel;
     status->boot_id = s_boot_id;
     status->uptime_ms = now_ms();
+    status->event_drops = s_event_queue_drops;
 
 #if CONFIG_ESPNOW_MESH_ROLE_CONTROLLER
     status->active_sequence = s_controller_active_sequence;
@@ -3442,6 +2833,7 @@ bool espnow_mesh_get_status(espnow_mesh_status_t *status)
 
     uint32_t current_ms = now_ms();
     size_t out_index = 0;
+    portENTER_CRITICAL(&s_satellite_table_lock);
     for (int i = 0; i < CONFIG_ESPNOW_MESH_MAX_SATELLITES; ++i) {
         const satellite_node_t *node = &s_satellites[i];
         if (!node->used) {
@@ -3465,6 +2857,7 @@ bool espnow_mesh_get_status(espnow_mesh_status_t *status)
         sat->sends_current = node->sends_current;
         sat->last_rssi = node->last_rssi;
     }
+    portEXIT_CRITICAL(&s_satellite_table_lock);
     status->satellite_count = out_index;
 #else
     status->known_satellites = s_have_controller ? 1 : 0;

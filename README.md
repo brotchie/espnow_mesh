@@ -144,6 +144,11 @@ Important options:
 - `CONFIG_ESPNOW_MESH_REGISTRATION_AP_ENABLE` and
   `CONFIG_ESPNOW_MESH_REGISTRATION_*`: SoftAP self-registration and channel
   discovery behavior.
+- `CONFIG_ESPNOW_MESH_CONTROLLER_TIMEOUT_MS`: how long a satellite keeps its
+  controller lock without hearing traffic before resuming discovery (0 keeps
+  the lock forever).
+- `CONFIG_ESPNOW_MESH_SATELLITE_EXPIRE_MS`: how long the controller keeps a
+  silent satellite before freeing its peer/table slot (0 keeps it forever).
 - `CONFIG_ESPNOW_MESH_SYNC_OUTPUT_*`: logic-analyzer GPIO output.
 - `CONFIG_ESPNOW_MESH_HIL_*`: deterministic HIL test mode, injected loss, and
   patch-distribution test settings.
@@ -173,3 +178,28 @@ apply command.
 
 This is intentionally a star topology around one controller. It does not route
 through satellites.
+
+## Security Notes
+
+Authentication is a truncated HMAC-SHA256 tag over every protocol packet, keyed
+by `CONFIG_ESPNOW_MESH_AUTH_KEY`. It gives integrity and authenticity: a
+receiver rejects any packet whose tag does not verify, so an attacker without
+the shared key cannot forge or alter mesh traffic. Keep these limitations in
+mind:
+
+- **No confidentiality.** ESP-NOW cannot encrypt broadcast/multicast vendor
+  action frames, so packet contents are sent in the clear. The HMAC only
+  authenticates; it does not hide payloads.
+- **No freshness.** The tag has no timestamp or nonce, so a captured, valid
+  packet can be replayed. Satellites drop duplicate sequence numbers within a
+  controller boot session, but an attacker who replays traffic from two
+  different `controller_boot_id` values in alternation can defeat that dedup and
+  have old authenticated packets reprocessed. Do not rely on the mesh for
+  replay-sensitive commands without an application-level nonce.
+- **Shared symmetric key.** Every node holds the same key, so any compromised
+  node can impersonate any other. There is no per-node key or forward secrecy.
+- **Change the defaults.** `CONFIG_ESPNOW_MESH_AUTH_KEY`,
+  `CONFIG_ESPNOW_MESH_REGISTRATION_SSID`, and
+  `CONFIG_ESPNOW_MESH_REGISTRATION_PASSWORD` ship with development values that
+  must be changed before deployment. With `CONFIG_ESPNOW_MESH_AUTH_ENABLE`
+  disabled, packets are filtered by mesh ID only and offer no security.
