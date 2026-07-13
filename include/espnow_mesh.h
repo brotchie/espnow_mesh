@@ -83,6 +83,14 @@ typedef struct {
         .task_core_id = ESPNOW_MESH_TASK_NO_AFFINITY,  \
     }
 
+/*
+ * Satellite receive callback. Invoked on the mesh task for the first accepted
+ * copy of each controller sequence (duplicates are suppressed). Do not block;
+ * copy what you need. `payload` points to `len` bytes (len may be 0) and is
+ * valid only for the duration of the call.
+ */
+typedef void (*espnow_mesh_rx_cb_t)(const uint8_t *payload, size_t len, void *user_ctx);
+
 /* The role this firmware was compiled for. */
 espnow_mesh_role_runtime_t espnow_mesh_role(void);
 
@@ -122,6 +130,25 @@ bool espnow_mesh_is_time_synced(void);
  * update, but satellite entries are always seen fully initialized.
  */
 bool espnow_mesh_get_status(espnow_mesh_status_t *status);
+
+/*
+ * Controller: queue a payload for reliable fan-out to all known satellites
+ * (broadcast plus per-satellite ACK tracking and unicast retries). Fire and
+ * forget: returns ESP_OK once queued, ESP_ERR_NO_MEM if a previously queued
+ * payload has not been sent yet (apply backpressure and retry),
+ * ESP_ERR_INVALID_SIZE if len exceeds CONFIG_ESPNOW_MESH_PAYLOAD_BYTES, or
+ * ESP_ERR_NOT_SUPPORTED on satellite or HIL-test builds. len may be 0. Safe to
+ * call from any task. Delivery outcome is observable via espnow_mesh_get_status()
+ * (last_sequence / last_sequence_complete).
+ */
+esp_err_t espnow_mesh_send(const void *payload, size_t len);
+
+/*
+ * Satellite: register the receive callback (or clear it with NULL). Returns
+ * ESP_ERR_NOT_SUPPORTED on controller builds. Set it before espnow_mesh_start()
+ * to avoid missing early frames.
+ */
+esp_err_t espnow_mesh_set_rx_callback(espnow_mesh_rx_cb_t cb, void *user_ctx);
 
 #ifdef __cplusplus
 }
