@@ -1,0 +1,9 @@
+fuzz_rx
+fuzz_patch
+corpus_rx/
+corpus_patch/
+crash-*
+leak-*
+timeout-*
+oom-*
+*.o
