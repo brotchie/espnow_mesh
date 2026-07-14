@@ -555,6 +555,21 @@ static uint32_t s_controller_last_expected;
 static uint32_t s_controller_last_acked;
 static bool s_controller_last_sequence_complete;
 
+/* Payload carried by the active reliable sequence, read by both the broadcast
+ * and unicast senders. Filled from the application buffer when a sequence
+ * begins; stays within CONFIG_ESPNOW_MESH_PAYLOAD_BYTES. */
+static uint8_t s_tx_payload[CONFIG_ESPNOW_MESH_PAYLOAD_BYTES];
+static uint16_t s_tx_payload_len;
+
+#if !CONFIG_ESPNOW_MESH_HIL_TEST_ENABLE
+/* Single-slot application send buffer, written by espnow_mesh_send() from any
+ * task and drained by the controller loop. */
+static portMUX_TYPE s_pending_payload_lock = portMUX_INITIALIZER_UNLOCKED;
+static uint8_t s_pending_payload[CONFIG_ESPNOW_MESH_PAYLOAD_BYTES];
+static uint16_t s_pending_payload_len;
+static bool s_have_pending_payload;
+#endif
+
 #if CONFIG_ESPNOW_MESH_HIL_TEST_ENABLE
 static uint16_t s_hil_time_resp_drop_pct;
 static uint32_t s_hil_time_resp_drop_seed;
@@ -915,18 +930,8 @@ static esp_err_t send_controller_packet(const uint8_t *dest_mac, uint32_t sequen
     };
     memcpy(msg.controller_mac, s_self_mac, ESP_NOW_ETH_ALEN);
 
-    int written = snprintf((char *)msg.payload, sizeof(msg.payload),
-                           "critical seq=%" PRIu32 " attempt=%" PRIu32 " uptime_ms=%" PRIu32,
-                           sequence, attempt_index, now_ms());
-    if (written < 0) {
-        msg.payload[0] = '\0';
-        msg.payload_len = 1;
-    } else if ((size_t)written >= sizeof(msg.payload)) {
-        msg.payload[sizeof(msg.payload) - 1] = '\0';
-        msg.payload_len = sizeof(msg.payload);
-    } else {
-        msg.payload_len = (uint16_t)written + 1;
-    }
+    msg.payload_len = s_tx_payload_len;
+    memcpy(msg.payload, s_tx_payload, s_tx_payload_len);
 
     size_t send_len = offsetof(espnow_mesh_data_msg_t, payload) + msg.payload_len;
     return mesh_send(dest_mac, &msg, send_len, ESPNOW_MESH_MSG_DATA);
@@ -1708,6 +1713,24 @@ static void expire_stale_satellites(void)
 }
 #endif
 
+#if !CONFIG_ESPNOW_MESH_HIL_TEST_ENABLE
+/* Move a queued application payload into the active-sequence buffer. Returns
+ * true if there was data to send. */
+static bool controller_take_pending_payload(void)
+{
+    bool have = false;
+    portENTER_CRITICAL(&s_pending_payload_lock);
+    if (s_have_pending_payload) {
+        s_tx_payload_len = s_pending_payload_len;
+        memcpy(s_tx_payload, s_pending_payload, s_pending_payload_len);
+        s_have_pending_payload = false;
+        have = true;
+    }
+    portEXIT_CRITICAL(&s_pending_payload_lock);
+    return have;
+}
+#endif
+
 static void controller_run(void)
 {
 #if CONFIG_ESPNOW_MESH_HIL_TEST_ENABLE
@@ -1719,6 +1742,15 @@ static void controller_run(void)
     while (true) {
         log_event_queue_drops_if_any();
         expire_stale_satellites();
+
+        /* Wait for the application to queue a payload. While idle, keep
+         * answering ACKs and time-sync requests; short slices bound send
+         * latency to ~100 ms. */
+        if (!controller_take_pending_payload()) {
+            drain_controller_events_until(now_ms() + 100, s_controller_active_sequence);
+            continue;
+        }
+
         sequence++;
         if (sequence == 0) {
             sequence = 1;
@@ -1771,6 +1803,8 @@ static uint32_t s_controller_boot_id;
 static bool s_have_last_sequence;
 static uint32_t s_last_sequence;
 static uint32_t s_next_time_sync_ms;
+static espnow_mesh_rx_cb_t s_rx_cb;
+static void *s_rx_cb_ctx;
 #if CONFIG_ESPNOW_MESH_CONTROLLER_TIMEOUT_MS > 0
 static uint32_t s_last_controller_rx_ms;
 #endif
@@ -2556,7 +2590,7 @@ static void handle_satellite_hil_command(const espnow_mesh_event_t *event)
     }
 
     bool duplicate =
-        s_have_last_hil_sequence && (int32_t)(cmd.sequence - s_last_hil_sequence) <= 0;
+        seq_is_duplicate(s_have_last_hil_sequence, cmd.sequence, s_last_hil_sequence);
     bool accepted = !duplicate;
     if (accepted) {
         s_have_last_hil_sequence = true;
@@ -2638,29 +2672,26 @@ static void handle_satellite_data(const espnow_mesh_event_t *event)
         return;
     }
 
-    bool duplicate =
-        s_have_last_sequence && (int32_t)(msg.sequence - s_last_sequence) <= 0;
+    bool duplicate = seq_is_duplicate(s_have_last_sequence, msg.sequence, s_last_sequence);
     bool accepted = !duplicate;
     if (accepted) {
         s_have_last_sequence = true;
         s_last_sequence = msg.sequence;
 
-        char payload[CONFIG_ESPNOW_MESH_PAYLOAD_BYTES + 1] = { 0 };
-        size_t copy_len = msg.payload_len;
-        if (copy_len > CONFIG_ESPNOW_MESH_PAYLOAD_BYTES) {
-            copy_len = CONFIG_ESPNOW_MESH_PAYLOAD_BYTES;
-        }
-        memcpy(payload, msg.payload, copy_len);
-        payload[CONFIG_ESPNOW_MESH_PAYLOAD_BYTES] = '\0';
-
         if (mesh_have_time()) {
             ESP_LOGI(TAG,
                      "rx seq=%" PRIu32 " attempt=%" PRIu32
-                     " rssi=%d mesh_time=%" PRId64 "us payload=\"%s\"",
-                     msg.sequence, msg.retry_index, event->rssi, mesh_time_us(), payload);
+                     " rssi=%d mesh_time=%" PRId64 "us bytes=%u",
+                     msg.sequence, msg.retry_index, event->rssi, mesh_time_us(),
+                     msg.payload_len);
         } else {
-            ESP_LOGI(TAG, "rx seq=%" PRIu32 " attempt=%" PRIu32 " rssi=%d payload=\"%s\"",
-                     msg.sequence, msg.retry_index, event->rssi, payload);
+            ESP_LOGI(TAG, "rx seq=%" PRIu32 " attempt=%" PRIu32 " rssi=%d bytes=%u",
+                     msg.sequence, msg.retry_index, event->rssi, msg.payload_len);
+        }
+
+        /* payload_len is bounded by data_msg_fields_valid(). */
+        if (s_rx_cb != NULL) {
+            s_rx_cb(msg.payload, msg.payload_len, s_rx_cb_ctx);
         }
     } else {
         ESP_LOGD(TAG, "duplicate seq=%" PRIu32 " attempt=%" PRIu32, msg.sequence,
@@ -2788,6 +2819,50 @@ espnow_mesh_role_runtime_t espnow_mesh_role(void)
     return ESPNOW_MESH_ROLE_CONTROLLER_RUNTIME;
 #else
     return ESPNOW_MESH_ROLE_SATELLITE_RUNTIME;
+#endif
+}
+
+esp_err_t espnow_mesh_send(const void *payload, size_t len)
+{
+#if CONFIG_ESPNOW_MESH_ROLE_CONTROLLER && !CONFIG_ESPNOW_MESH_HIL_TEST_ENABLE
+    if (len > sizeof(s_pending_payload)) {
+        return ESP_ERR_INVALID_SIZE;
+    }
+    if (len > 0 && payload == NULL) {
+        return ESP_ERR_INVALID_ARG;
+    }
+
+    esp_err_t err;
+    portENTER_CRITICAL(&s_pending_payload_lock);
+    if (s_have_pending_payload) {
+        err = ESP_ERR_NO_MEM;
+    } else {
+        if (len > 0) {
+            memcpy(s_pending_payload, payload, len);
+        }
+        s_pending_payload_len = (uint16_t)len;
+        s_have_pending_payload = true;
+        err = ESP_OK;
+    }
+    portEXIT_CRITICAL(&s_pending_payload_lock);
+    return err;
+#else
+    (void)payload;
+    (void)len;
+    return ESP_ERR_NOT_SUPPORTED;
+#endif
+}
+
+esp_err_t espnow_mesh_set_rx_callback(espnow_mesh_rx_cb_t cb, void *user_ctx)
+{
+#if CONFIG_ESPNOW_MESH_ROLE_CONTROLLER
+    (void)cb;
+    (void)user_ctx;
+    return ESP_ERR_NOT_SUPPORTED;
+#else
+    s_rx_cb_ctx = user_ctx;
+    s_rx_cb = cb;
+    return ESP_OK;
 #endif
 }
 

@@ -1,0 +1,40 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  host-tests:
+    name: Host unit tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Run host unit tests
+        run: ./test/host/run.sh
+
+  build-examples:
+    name: Build ${{ matrix.path }} (${{ matrix.target }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { path: examples/basic_controller, target: esp32,   command: "idf.py build" }
+          - { path: examples/basic_controller, target: esp32s3, command: "idf.py build" }
+          - { path: examples/basic_controller, target: esp32c3, command: "idf.py build" }
+          - { path: examples/basic_satellite,  target: esp32,   command: "idf.py build" }
+          - { path: examples/basic_satellite,  target: esp32s3, command: "idf.py build" }
+          - { path: examples/basic_satellite,  target: esp32c3, command: "idf.py build" }
+          # HIL builds exercise the CONFIG_ESPNOW_MESH_HIL_TEST_ENABLE code paths.
+          - { path: examples/hil_bench, target: esp32, command: "idf.py -DSDKCONFIG_DEFAULTS=configs/device0-controller-hil.defaults build" }
+          - { path: examples/hil_bench, target: esp32, command: "idf.py -DSDKCONFIG_DEFAULTS=configs/device1-satellite-hil.defaults build" }
+    steps:
+      - uses: actions/checkout@v4
+      - name: esp-idf build
+        uses: espressif/esp-idf-ci-action@v1
+        with:
+          esp_idf_version: release-v5.5
+          target: ${{ matrix.target }}
+          path: ${{ matrix.path }}
+          command: ${{ matrix.command }}

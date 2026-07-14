@@ -30,3 +30,15 @@ static inline bool mac_equal(const uint8_t *left, const uint8_t *right)
 {
     return memcmp(left, right, ESP_NOW_ETH_ALEN) == 0;
 }
+
+/*
+ * Serial-number (RFC 1982) duplicate test: true when `seq` is not newer than
+ * `last`, evaluated wrap-safe over the 32-bit sequence space so it stays correct
+ * across a counter wrap. `have_last` guards the first-ever packet (nothing seen
+ * yet is never a duplicate). Correct while the true distance between seq and
+ * last stays below 2^31.
+ */
+static inline bool seq_is_duplicate(bool have_last, uint32_t seq, uint32_t last)
+{
+    return have_last && (int32_t)(seq - last) <= 0;
+}

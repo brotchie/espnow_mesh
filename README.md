@@ -113,11 +113,29 @@ The HIL profiles and bench notes are in `examples/hil_bench` and
 
 - `espnow_mesh_start()` starts the mesh engine in its own FreeRTOS task.
 - `espnow_mesh_run()` runs the mesh engine on the current task and blocks.
+- `espnow_mesh_send()` (controller) queues a payload for reliable fan-out to all
+  satellites; fire-and-forget with backpressure (`ESP_ERR_NO_MEM` while a prior
+  payload is still in flight).
+- `espnow_mesh_set_rx_callback()` (satellite) registers a callback invoked once
+  per accepted controller sequence with the received payload.
 - `espnow_mesh_get_time_us()` returns the controller monotonic time estimate.
 - `espnow_mesh_is_time_synced()` reports whether the local time estimate is
   valid.
 - `espnow_mesh_get_status()` returns controller/satellite status for UIs.
 - `espnow_mesh_role()` reports the compiled controller/satellite role.
+
+Minimal usage — controller sends, satellites receive:
+
+```c
+/* Controller */
+espnow_mesh_start(NULL);
+espnow_mesh_send("hello", 5);   /* reliably fanned out + ACK-tracked */
+
+/* Satellite */
+static void on_data(const uint8_t *payload, size_t len, void *ctx) { /* ... */ }
+espnow_mesh_set_rx_callback(on_data, NULL);
+espnow_mesh_start(NULL);
+```
 
 ## Configuration
 
@@ -155,10 +173,12 @@ Important options:
 
 ## Runtime Model
 
-The controller broadcasts critical data packets, tracks every known satellite
-expected to ACK the active sequence, then retries missing satellites with
-unicast packets. Satellites process the first copy of a sequence and ACK every
-valid copy so controller retries can converge.
+When the application calls `espnow_mesh_send()`, the controller broadcasts that
+payload as a critical data packet, tracks every known satellite expected to ACK
+the active sequence, then retries missing satellites with unicast packets. When
+no payload is queued the controller idles, still answering ACKs and time-sync
+requests. Satellites process the first copy of a sequence (delivering it to the
+receive callback) and ACK every valid copy so controller retries can converge.
 
 Satellites periodically send time-sync requests. The controller replies with
 controller receive/send timestamps. Satellites estimate controller monotonic
