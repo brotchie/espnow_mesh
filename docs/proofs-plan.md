@@ -1,7 +1,14 @@
 # Formal Verification Plan (TLA+)
 
 This document plans a TLA+ model of the `espnow_mesh` protocol and the guarantees
-worth checking with it. It is a plan, not a spec — no `.tla` files exist yet.
+worth checking with it.
+
+> **Status:** implemented. The specs, configs, headless runner, and CI gate
+> live in [`../tla/`](../tla/) (`cd tla && make check`). Every property below is
+> checked, and the recommended-order items — including the replay/recovery
+> fix-validation matrix — reproduce as expected. See
+> [`../tla/README.md`](../tla/README.md) for the module/property map and
+> per-check outcomes. No C was changed for this work.
 
 ## Scope and intent
 
@@ -122,7 +129,9 @@ wrong by hand.
 
 ## Tooling
 
-Install the TLA+ tools (`tla2tools.jar` / the VS Code TLA+ extension / the
-Apalache symbolic checker for larger state spaces). None are currently present
-in this repo's environment, so the first step also covers wiring a
-`make check` / CI job that runs TLC headless against each `.cfg`.
+Implemented in [`../tla/`](../tla/): `make tools` fetches `tla2tools.jar`
+(GitHub release, with a `tlaplus-mcp` npm fallback for sandboxes that cannot
+reach `github.com`), and `make check` runs TLC headless against every `.cfg`,
+asserting each check's documented outcome so it works as a CI gate. For larger
+state spaces the Apalache symbolic checker or the VS Code TLA+ extension can be
+pointed at the same `.tla`/`.cfg` files.
