@@ -1,0 +1,7 @@
+# TLC tooling and scratch output (fetch the jar with `make tools`).
+.tools/
+.work/
+states/
+*_TTrace_*.tla
+*_TTrace_*.bin
+*.st
