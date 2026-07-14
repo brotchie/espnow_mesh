@@ -2590,7 +2590,7 @@ static void handle_satellite_hil_command(const espnow_mesh_event_t *event)
     }
 
     bool duplicate =
-        s_have_last_hil_sequence && (int32_t)(cmd.sequence - s_last_hil_sequence) <= 0;
+        seq_is_duplicate(s_have_last_hil_sequence, cmd.sequence, s_last_hil_sequence);
     bool accepted = !duplicate;
     if (accepted) {
         s_have_last_hil_sequence = true;
@@ -2672,8 +2672,7 @@ static void handle_satellite_data(const espnow_mesh_event_t *event)
         return;
     }
 
-    bool duplicate =
-        s_have_last_sequence && (int32_t)(msg.sequence - s_last_sequence) <= 0;
+    bool duplicate = seq_is_duplicate(s_have_last_sequence, msg.sequence, s_last_sequence);
     bool accepted = !duplicate;
     if (accepted) {
         s_have_last_sequence = true;
