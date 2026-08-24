@@ -84,6 +84,7 @@ static uint32_t s_boot_id;
 static uint8_t s_mesh_channel = CONFIG_ESPNOW_MESH_CHANNEL;
 static bool s_espnow_ready;
 static bool s_mesh_initialized;
+static espnow_mesh_config_t s_start_config = ESPNOW_MESH_DEFAULT_CONFIG();
 
 #if !CONFIG_ESPNOW_MESH_ROLE_CONTROLLER
 #if CONFIG_ESPNOW_MESH_REGISTRATION_AP_ENABLE
@@ -325,6 +326,27 @@ static void wifi_event_handler(void *arg, esp_event_base_t event_base, int32_t e
 
 static void init_wifi(void)
 {
+    if (s_start_config.use_existing_wifi) {
+#if CONFIG_ESPNOW_MESH_REGISTRATION_AP_ENABLE
+        ESP_LOGE(TAG, "external Wi-Fi mode is incompatible with registration SoftAP support");
+        ESP_ERROR_CHECK(ESP_ERR_INVALID_STATE);
+#endif
+
+        ESP_ERROR_CHECK(esp_event_handler_instance_register(WIFI_EVENT, ESP_EVENT_ANY_ID,
+                                                            wifi_event_handler, NULL, NULL));
+        ESP_ERROR_CHECK(esp_wifi_set_ps(WIFI_PS_NONE));
+        if (s_start_config.adopt_current_wifi_channel) {
+            uint8_t primary = 0;
+            wifi_second_chan_t secondary = WIFI_SECOND_CHAN_NONE;
+            ESP_ERROR_CHECK(esp_wifi_get_channel(&primary, &secondary));
+            s_mesh_channel = clamp_wifi_channel(primary);
+        }
+        ESP_ERROR_CHECK(esp_wifi_get_mac(WIFI_IF_STA, s_self_mac));
+        ESP_LOGI(TAG, "using application-managed Wi-Fi station " MACSTR ", channel %u",
+                 MAC2STR(s_self_mac), s_mesh_channel);
+        return;
+    }
+
     esp_err_t err = esp_netif_init();
     if (err != ESP_ERR_INVALID_STATE) {
         ESP_ERROR_CHECK(err);
@@ -3001,6 +3023,16 @@ esp_err_t espnow_mesh_start(const espnow_mesh_config_t *config)
     if (cfg.task_name == NULL || cfg.task_stack_bytes == 0 || cfg.task_priority == 0) {
         return ESP_ERR_INVALID_ARG;
     }
+#if CONFIG_ESPNOW_MESH_REGISTRATION_AP_ENABLE
+    if (cfg.use_existing_wifi) {
+        return ESP_ERR_INVALID_ARG;
+    }
+#endif
+    if (cfg.adopt_current_wifi_channel && !cfg.use_existing_wifi) {
+        return ESP_ERR_INVALID_ARG;
+    }
+
+    s_start_config = cfg;
 
     BaseType_t ok = pdFALSE;
     if (cfg.task_core_id == ESPNOW_MESH_TASK_NO_AFFINITY) {

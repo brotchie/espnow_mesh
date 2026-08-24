@@ -30,6 +30,8 @@ typedef struct {
     uint32_t task_stack_bytes;  /* stack depth in bytes (must be non-zero) */
     uint32_t task_priority;     /* FreeRTOS priority (must be non-zero) */
     int task_core_id;           /* core to pin to, or ESPNOW_MESH_TASK_NO_AFFINITY */
+    bool use_existing_wifi;     /* application already initialized and started Wi-Fi */
+    bool adopt_current_wifi_channel; /* use the active Wi-Fi channel for ESP-NOW */
 } espnow_mesh_config_t;
 
 /* Per-satellite view within espnow_mesh_status_t (controller role). */
@@ -81,6 +83,8 @@ typedef struct {
         .task_stack_bytes = 8192,                      \
         .task_priority = 5,                            \
         .task_core_id = ESPNOW_MESH_TASK_NO_AFFINITY,  \
+        .use_existing_wifi = false,                    \
+        .adopt_current_wifi_channel = false,           \
     }
 
 /*

@@ -137,6 +137,20 @@ espnow_mesh_set_rx_callback(on_data, NULL);
 espnow_mesh_start(NULL);
 ```
 
+When the host application already owns an initialized and started Wi-Fi
+station, the mesh can share that radio and adopt its current channel:
+
+```c
+espnow_mesh_config_t config = ESPNOW_MESH_DEFAULT_CONFIG();
+config.use_existing_wifi = true;
+config.adopt_current_wifi_channel = true;
+espnow_mesh_start(&config);
+```
+
+External-Wi-Fi mode requires `CONFIG_ESPNOW_MESH_REGISTRATION_AP_ENABLE=n`.
+The application must keep Wi-Fi connected and must not change channels while
+the mesh is running.
+
 ## Configuration
 
 Run `idf.py menuconfig` and open `ESP-NOW mesh component`.
