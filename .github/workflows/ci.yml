@@ -13,6 +13,16 @@ jobs:
       - name: Run host unit tests
         run: ./test/host/run.sh
 
+  fuzz-smoke:
+    name: Fuzz smoke (RX path)
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install clang + sanitizer runtimes
+        run: sudo apt-get update && sudo apt-get install -y clang-18 libclang-rt-18-dev
+      - name: Run RX-path fuzz smoke
+        run: CC=clang-18 RUNS=1000000 ./test/host/fuzz/run.sh
+
   build-examples:
     name: Build ${{ matrix.path }} (${{ matrix.target }})
     runs-on: ubuntu-latest

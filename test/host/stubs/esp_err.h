@@ -1,4 +1,6 @@
 #pragma once
+#include <stdint.h>
+#include <stdlib.h>
 typedef int esp_err_t;
 #define ESP_OK 0
 #define ESP_FAIL (-1)
@@ -7,3 +9,9 @@ typedef int esp_err_t;
 #define ESP_ERR_INVALID_STATE 0x103
 #define ESP_ERR_INVALID_SIZE 0x104
 #define ESP_ERR_NOT_SUPPORTED 0x106
+#define ESP_ERR_NVS_NO_FREE_PAGES 0x110
+#define ESP_ERR_NVS_NEW_VERSION_FOUND 0x111
+#define ESP_ERR_ESPNOW_NOT_INIT 0x1130
+#define ESP_ERR_ESPNOW_EXIST 0x1131
+const char *esp_err_to_name(esp_err_t err);
+#define ESP_ERROR_CHECK(x) do { esp_err_t err_rc_ = (x); if (err_rc_ != ESP_OK) abort(); } while (0)
